@@ -1,0 +1,60 @@
+format_version = 1
+
+[world]
+name = "FreshBasilWorld"
+uuid = "basil-world-2r2t"
+
+[geometry]
+chunk_size = [4, 4, 4]
+region_size = [1, 1, 1]
+voxel_schema = "dense_u32_voxel_key"
+axis_convention = "x_right_y_up_z_forward"
+
+[bounds]
+mode = "explicit"
+min_region = [0, 0, 0]
+max_region = [1, 0, 0]
+
+[paths]
+regions_dir = "regions"
+textures_dir = "textures"
+
+[[registry]]
+voxel_key = 0
+material_id = 0
+flags = []
+name_hash = 0
+
+[[registry]]
+voxel_key = 1
+material_id = 0
+flags = ["opaque", "collidable"]
+name_hash = 0
+
+[[registry]]
+voxel_key = 2
+material_id = 1
+flags = ["opaque", "collidable"]
+name_hash = 0
+
+[[registry]]
+voxel_key = 3
+material_id = 2
+flags = ["special"]
+name_hash = 0
+
+[[textures]]
+id = "terrain_red"
+path = "terrain_red.btx"
+
+[[textures]]
+id = "terrain_blue"
+path = "terrain_blue.btx"
+
+[[regions]]
+path = "r_0_0_0.bvx"
+coord = [0, 0, 0]
+
+[[regions]]
+path = "r_1_0_0.bvx"
+coord = [1, 0, 0]
