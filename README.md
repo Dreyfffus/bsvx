@@ -181,14 +181,14 @@ That means the library is useful for:
 
 Basil Voxel is built so an engine can:
 
-- load a manifest-driven world
+- load a manifest-described world
 - load a standalone region as an asset
 - decode chunks to canonical dense voxel-key buffers
 - mutate chunk data
 - attach baked payload sections
 - save the result back to disk
 
-For shipping or integration through the DLL boundary, the intended public surface is the exported API, not the full internal implementation headers.
+For shipping or integration through the DLL boundary, the intended public surface is the exported API, not the full internal implementation headers. (bsvx_dll.h)
 
 ---
 
@@ -207,26 +207,4 @@ Load a world, scan summaries, modify chunks, repack regions, save.
 
 ## Project status
 
-This project is evolving alongside the Basil engine and its tooling.
-
-The current direction emphasizes:
-
-- robust storage
-- explicit metadata
-- chunk-level manipulation
-- binary stability
-- clean engine-facing access
-
----
-
-## Summary
-
-Basil Voxel is a structured voxel asset format and tooling library built for worlds that need to be:
-
-- portable
-- inspectable
-- chunk-addressable
-- bake-friendly
-- renderer-agnostic
-
-It is not just a file format. It is the bridge between authored voxel content and engine-specific runtime data.
+Workable.
