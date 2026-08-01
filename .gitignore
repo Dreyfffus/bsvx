@@ -420,3 +420,11 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# CMake / Ninja out-of-source builds (see CMakeLists.txt)
+build/
+cmake-build-*/
+
+# Artifacts of the documented one-liner g++ build
+/libbsvx.so
+/bsvx_tests

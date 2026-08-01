@@ -1,5 +1,6 @@
 #include "bvx_header.h"
 #include "codec.h"
+#include <algorithm>
 
 namespace bsvx::bvx {
 

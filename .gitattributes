@@ -1,0 +1,8 @@
+# A world's manifest hash is FNV-1a-64 over the raw bytes of manifest.toml, and every .bvx stores
+# the hash it was baked against. Any line-ending translation invalidates the whole world
+# ("manifest hash mismatch for region ..."). See GODOT_INTEGRATION.md §9.1.
+*.toml -text
+
+# Binary containers: raw little-endian POD dumps, never text.
+*.bvx binary
+*.btx binary

@@ -1,9 +1,13 @@
 #pragma once
+#include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
-#include <span>
 
 namespace bsvx {
 
