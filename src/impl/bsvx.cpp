@@ -57,10 +57,55 @@ namespace bsvx {
             return bytes;
         }
 
-        static uint64_t hash_file(const std::filesystem::path& path)
+        class NativeFileSystem final : public FileSystem {
+        public:
+            std::filesystem::path normalize(const std::filesystem::path& path) const override
+            {
+                return std::filesystem::absolute(path).lexically_normal();
+            }
+
+            bool is_file(const std::filesystem::path& path) const override
+            {
+                std::error_code ec;
+                return std::filesystem::is_regular_file(path, ec);
+            }
+
+            bool is_directory(const std::filesystem::path& path) const override
+            {
+                std::error_code ec;
+                return std::filesystem::is_directory(path, ec);
+            }
+
+            std::vector<std::byte> read_file(const std::filesystem::path& path) const override
+            {
+                return read_file_bytes(path);
+            }
+
+            std::vector<std::filesystem::path> list_files(const std::filesystem::path& dir, std::string_view extension) const override
+            {
+                std::vector<std::filesystem::path> out;
+                std::error_code ec;
+                if (!std::filesystem::is_directory(dir, ec)) return out;
+
+                for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                    if (ec) break;
+                    if (!entry.is_regular_file()) continue;
+                    if (entry.path().extension() != extension) continue;
+                    out.push_back(entry.path().filename());
+                }
+                return out;
+            }
+        };
+
+        static btx::Archive load_btx(const FileSystem& fs, const std::filesystem::path& path)
         {
-            const auto bytes = read_file_bytes(path);
-            return fnv1a64_bytes(std::span(bytes.data(), bytes.size()));
+            try {
+                const auto bytes = fs.read_file(path);
+                return btx::Archive::load_from_memory(std::span(bytes.data(), bytes.size()));
+            }
+            catch (const std::exception& e) {
+                throw std::runtime_error("[bsvx]: Parser: could not load .btx '" + path.string() + "': " + e.what());
+            }
         }
 
         static std::string trim_nul_padded(const char* cstr, size_t max_len)
@@ -260,14 +305,16 @@ namespace bsvx {
             }
         }
 
-        static void parse_hashes(Manifest& manifest, const toml::table& tbl)
+        // manifest_hash is always the hash of the manifest's raw bytes, whatever [hashes] claims --
+        // every .bvx is validated against it, so it has to describe the file that was actually read.
+        static void parse_hashes(Manifest& manifest, const toml::table& tbl, uint64_t manifest_bytes_hash)
         {
             if (auto hashes = tbl["hashes"].as_table()) {
                 manifest.world_desc.registry_hash = optional_u64((*hashes)["registry"], manifest.world_desc.registry_hash);
                 manifest.world_desc.manifest_hash = optional_u64((*hashes)["manifest"], manifest.world_desc.manifest_hash);
             }
 
-            manifest.world_desc.manifest_hash = hash_file(manifest.manifest_path);
+            manifest.world_desc.manifest_hash = manifest_bytes_hash;
         }
 
         static void parse_registry(Manifest& manifest, const toml::table& tbl)
@@ -647,33 +694,44 @@ namespace bsvx {
 
     } // namespace
 
-    std::filesystem::path Parser::resolve_manifest_path(const std::filesystem::path& path)
+    const FileSystem& native_filesystem()
     {
-        if (std::filesystem::is_regular_file(path)) {
+        static const NativeFileSystem instance{};
+        return instance;
+    }
+
+    std::filesystem::path Parser::resolve_manifest_path(const std::filesystem::path& path, const FileSystem& fs)
+    {
+        if (fs.is_file(path)) {
             if (path.extension() == ".toml") {
                 return path.lexically_normal();
             }
             throw std::runtime_error("[bsvx]: Parser: expected a manifest .toml file or a root directory");
         }
 
-        if (!std::filesystem::is_directory(path)) {
+        if (!fs.is_directory(path)) {
             throw std::runtime_error("[bsvx]: Parser: path does not exist: " + path.string());
         }
 
         const auto manifest = path / "manifest.toml";
-        if (!std::filesystem::exists(manifest)) {
+        if (!fs.is_file(manifest)) {
             throw std::runtime_error("[bsvx]: Parser: manifest.toml not found in directory: " + path.string());
         }
         return manifest.lexically_normal();
     }
 
-    Manifest Parser::parse_manifest(const std::filesystem::path& manifest_path)
+    Manifest Parser::parse_manifest(const std::filesystem::path& manifest_path, const FileSystem& fs)
     {
-        const auto absolute_manifest = std::filesystem::absolute(resolve_manifest_path(manifest_path)).lexically_normal();
+        const auto absolute_manifest = fs.normalize(resolve_manifest_path(manifest_path, fs));
+
+        // Read once and parse the bytes: the manifest hash has to be taken over exactly what was
+        // parsed, and a VFS has no path for toml::parse_file to open.
+        const auto manifest_bytes = fs.read_file(absolute_manifest);
+        const std::string_view manifest_text(reinterpret_cast<const char*>(manifest_bytes.data()), manifest_bytes.size());
 
         toml::table tbl;
         try {
-            tbl = toml::parse_file(absolute_manifest.string());
+            tbl = toml::parse(manifest_text, absolute_manifest.string());
         }
         catch (const toml::parse_error& err) {
             std::ostringstream oss;
@@ -690,38 +748,31 @@ namespace bsvx {
         parse_geometry(manifest, tbl);
         parse_bounds(manifest, tbl);
         parse_paths(manifest, tbl);
-        parse_hashes(manifest, tbl);
+        parse_hashes(manifest, tbl, fnv1a64_bytes(std::span(manifest_bytes.data(), manifest_bytes.size())));
         parse_registry(manifest, tbl);
         parse_textures(manifest, tbl);
         parse_regions(manifest, tbl);
 
         if (manifest.textures.empty()) {
-            auto_discover_textures(manifest);
+            auto_discover_textures(manifest, fs);
             synthesize_missing_texture_refs(manifest);
         }
         if (manifest.regions.empty()) {
-            auto_discover_regions(manifest);
+            auto_discover_regions(manifest, fs);
         }
 
         return manifest;
     }
 
-    void Parser::auto_discover_textures(Manifest& manifest)
+    void Parser::auto_discover_textures(Manifest& manifest, const FileSystem& fs)
     {
         manifest.textures.clear();
 
         const auto texture_root = make_absolute_from_root(manifest.root_dir, manifest.textures_dir);
-        if (!std::filesystem::exists(texture_root)) {
-            return;
-        }
-
-        for (const auto& entry : std::filesystem::directory_iterator(texture_root)) {
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() != ".btx") continue;
-
+        for (const auto& file_name : fs.list_files(texture_root, ".btx")) {
             TextureReference ref{};
-            ref.relative_path = std::filesystem::relative(entry.path(), texture_root).lexically_normal();
-            ref.absolute_path = entry.path().lexically_normal();
+            ref.relative_path = file_name;
+            ref.absolute_path = (texture_root / file_name).lexically_normal();
             ref.id = ref.relative_path.stem().string();
             ref.path_hash = fnv1a64_string((manifest.textures_dir / ref.relative_path).generic_string());
             ref.content_hash = 0;
@@ -734,22 +785,15 @@ namespace bsvx {
             });
     }
 
-    void Parser::auto_discover_regions(Manifest& manifest)
+    void Parser::auto_discover_regions(Manifest& manifest, const FileSystem& fs)
     {
         manifest.regions.clear();
 
         const auto region_root = make_absolute_from_root(manifest.root_dir, manifest.regions_dir);
-        if (!std::filesystem::exists(region_root)) {
-            return;
-        }
-
-        for (const auto& entry : std::filesystem::directory_iterator(region_root)) {
-            if (!entry.is_regular_file()) continue;
-            if (entry.path().extension() != ".bvx") continue;
-
+        for (const auto& file_name : fs.list_files(region_root, ".bvx")) {
             RegionReference ref{};
-            ref.relative_path = std::filesystem::relative(entry.path(), region_root).lexically_normal();
-            ref.absolute_path = entry.path().lexically_normal();
+            ref.relative_path = file_name;
+            ref.absolute_path = (region_root / file_name).lexically_normal();
             manifest.regions.push_back(std::move(ref));
         }
 
@@ -759,36 +803,34 @@ namespace bsvx {
             });
     }
 
-    WorldPackage Parser::load_region(const std::filesystem::path& region_path)
+    WorldPackage Parser::make_standalone_package(bvx::Archive&& archive,
+        const std::filesystem::path& root_dir,
+        const std::string& name,
+        const std::filesystem::path& region_file_name,
+        bool load_textures,
+        const FileSystem& fs)
     {
-        const auto absolute_region = std::filesystem::absolute(region_path).lexically_normal();
-        auto region_archive = bvx::Archive::load_from_file(absolute_region.string());
-        if (!region_archive) {
-            throw std::runtime_error("[bsvx]: Parser: could not load standalone region: " + absolute_region.string());
-        }
-        if (!region_archive->is_standalone()) {
-            throw std::runtime_error("[bsvx]: Parser: region is not standalone: " + absolute_region.string());
-        }
-
         WorldPackage pkg{};
         pkg.manifest.synthetic_from_standalone_region = true;
         pkg.manifest.manifest_path.clear();
-        pkg.manifest.root_dir = absolute_region.parent_path();
-        pkg.manifest.name = absolute_region.stem().string();
+        pkg.manifest.root_dir = root_dir;
+        pkg.manifest.name = name;
         pkg.manifest.format_version = 1;
-        pkg.manifest.world_desc = *region_archive->standalone;
-        pkg.manifest.world_desc.manifest_hash = region_archive->manifest_hash;
-        pkg.manifest.world_desc.registry_hash = region_archive->registry_hash;
+        pkg.manifest.world_desc = *archive.standalone;
+        pkg.manifest.world_desc.manifest_hash = archive.manifest_hash;
+        pkg.manifest.world_desc.registry_hash = archive.registry_hash;
 
         RegionReference region_ref{};
-        region_ref.relative_path = absolute_region.filename();
-        region_ref.absolute_path = absolute_region;
-        region_ref.coord = std::array<int32_t, 3>{ region_archive->region_x, region_archive->region_y, region_archive->region_z };
+        region_ref.relative_path = region_file_name;
+        if (!region_file_name.empty() && !root_dir.empty()) {
+            region_ref.absolute_path = (root_dir / region_file_name).lexically_normal();
+        }
+        region_ref.coord = std::array<int32_t, 3>{ archive.region_x, archive.region_y, archive.region_z };
         pkg.manifest.regions.push_back(region_ref);
 
         RegionAsset region_asset{};
         region_asset.ref = region_ref;
-        region_asset.archive = std::move(*region_archive);
+        region_asset.archive = std::move(archive);
         pkg.regions.push_back(std::move(region_asset));
 
         for (const bvx::BtxRef& btx_ref : pkg.manifest.world_desc.texture_refs) {
@@ -801,75 +843,122 @@ namespace bsvx {
             pkg.manifest.textures.push_back(tex_ref);
         }
 
+        if (!load_textures) {
+            return pkg;
+        }
+
         if (pkg.manifest.textures.empty()) {
             pkg.manifest.textures_dir = ".";
-            auto_discover_textures(pkg.manifest);
+            auto_discover_textures(pkg.manifest, fs);
             synthesize_missing_texture_refs(pkg.manifest);
         }
 
         for (const TextureReference& ref : pkg.manifest.textures) {
-            auto tex_archive = btx::Archive::load_from_file(ref.absolute_path.string());
-            if (!tex_archive) {
-                throw std::runtime_error("[bsvx]: Parser: could not load .btx: " + ref.absolute_path.string());
-            }
             TextureAsset asset{};
             asset.ref = ref;
-            asset.archive = std::move(*tex_archive);
+            asset.archive = load_btx(fs, ref.absolute_path);
             pkg.textures.push_back(std::move(asset));
         }
 
         return pkg;
     }
 
-    WorldPackage Parser::load_world(const std::filesystem::path& manifest_or_root)
+    WorldPackage Parser::load_region(const std::filesystem::path& region_path, const FileSystem& fs)
     {
-        if (std::filesystem::is_regular_file(manifest_or_root) && manifest_or_root.extension() == ".bvx") {
-            return load_region(manifest_or_root);
+        const auto absolute_region = fs.normalize(region_path);
+        auto region_archive = bvx::Archive::load_from_memory(fs.read_file(absolute_region));
+        if (!region_archive.is_standalone()) {
+            throw std::runtime_error("[bsvx]: Parser: region is not standalone: " + absolute_region.string());
+        }
+
+        return make_standalone_package(std::move(region_archive),
+            absolute_region.parent_path(),
+            absolute_region.stem().string(),
+            absolute_region.filename(),
+            true,
+            fs);
+    }
+
+    WorldPackage Parser::load_region_memory(std::span<const std::byte> bytes, const std::filesystem::path& texture_root, const FileSystem& fs)
+    {
+        return wrap_standalone_region(bvx::Archive::load_from_memory(bytes), texture_root, fs);
+    }
+
+    WorldPackage Parser::wrap_standalone_region(bvx::Archive&& archive, const std::filesystem::path& texture_root, const FileSystem& fs)
+    {
+        if (!archive.is_standalone()) {
+            throw std::runtime_error("[bsvx]: Parser: region is not standalone");
+        }
+
+        const bool load_textures = !texture_root.empty();
+        const auto root_dir = load_textures ? fs.normalize(texture_root) : std::filesystem::path{};
+
+        return make_standalone_package(std::move(archive), root_dir, "memory_region", {}, load_textures, fs);
+    }
+
+    WorldPackage Parser::create_world(const bvx::GeometryDesc& geometry)
+    {
+        if (geometry.chunk_size_x == 0 || geometry.chunk_size_y == 0 || geometry.chunk_size_z == 0 ||
+            geometry.region_size_x == 0 || geometry.region_size_y == 0 || geometry.region_size_z == 0) {
+            throw std::invalid_argument("[bsvx]: Parser: geometry dimensions must all be non-zero");
+        }
+        // Chunk-local AABBs in a ChunkSummary are uint8_t.
+        if (geometry.chunk_size_x > 255 || geometry.chunk_size_y > 255 || geometry.chunk_size_z > 255) {
+            throw std::invalid_argument("[bsvx]: Parser: chunk dimensions must be <= 255");
         }
 
         WorldPackage pkg{};
-        pkg.manifest = parse_manifest(manifest_or_root);
+        pkg.manifest.format_version = 1;
+        pkg.manifest.regions_dir = "regions";
+        pkg.manifest.textures_dir = "textures";
+        pkg.manifest.world_desc.geometry = geometry;
+        pkg.manifest.world_desc.voxel_schema = VoxelSchema::DENSE_U32_VOXEL_KEY;
+        pkg.manifest.world_desc.axis_convention = AxisConvention::X_RIGHT_Y_UP_Z_FORWARD;
+        pkg.manifest.world_desc.bounds_mode = BoundsMode::UNBOUNDED;
+        return pkg;
+    }
+
+    WorldPackage Parser::load_world(const std::filesystem::path& manifest_or_root, const FileSystem& fs)
+    {
+        if (manifest_or_root.extension() == ".bvx" && fs.is_file(manifest_or_root)) {
+            return load_region(manifest_or_root, fs);
+        }
+
+        WorldPackage pkg{};
+        pkg.manifest = parse_manifest(manifest_or_root, fs);
 
         for (const TextureReference& ref : pkg.manifest.textures) {
-            auto tex_archive = btx::Archive::load_from_file(ref.absolute_path.string());
-            if (!tex_archive) {
-                throw std::runtime_error("[bsvx]: Parser: could not load .btx: " + ref.absolute_path.string());
-            }
-
             TextureAsset asset{};
             asset.ref = ref;
-            asset.archive = std::move(*tex_archive);
+            asset.archive = load_btx(fs, ref.absolute_path);
             pkg.textures.push_back(std::move(asset));
         }
 
         for (const RegionReference& ref : pkg.manifest.regions) {
-            auto reg_archive = bvx::Archive::load_from_file(ref.absolute_path.string());
-            if (!reg_archive) {
-                throw std::runtime_error("[bsvx]: Parser: could not load .bvx: " + ref.absolute_path.string());
-            }
+            bvx::Archive reg_archive = bvx::Archive::load_from_memory(fs.read_file(ref.absolute_path));
 
             if (ref.coord) {
                 const auto expected = *ref.coord;
-                if (reg_archive->region_x != expected[0] ||
-                    reg_archive->region_y != expected[1] ||
-                    reg_archive->region_z != expected[2]) {
+                if (reg_archive.region_x != expected[0] ||
+                    reg_archive.region_y != expected[1] ||
+                    reg_archive.region_z != expected[2]) {
                     throw std::runtime_error("[bsvx]: Parser: region coordinate mismatch for " + ref.absolute_path.string());
                 }
             }
 
-            if (pkg.manifest.world_desc.manifest_hash != 0 && reg_archive->manifest_hash != 0 &&
-                reg_archive->manifest_hash != pkg.manifest.world_desc.manifest_hash) {
+            if (pkg.manifest.world_desc.manifest_hash != 0 && reg_archive.manifest_hash != 0 &&
+                reg_archive.manifest_hash != pkg.manifest.world_desc.manifest_hash) {
                 throw std::runtime_error("[bsvx]: Parser: manifest hash mismatch for region " + ref.absolute_path.string());
             }
 
-            if (pkg.manifest.world_desc.registry_hash != 0 && reg_archive->registry_hash != 0 &&
-                reg_archive->registry_hash != pkg.manifest.world_desc.registry_hash) {
+            if (pkg.manifest.world_desc.registry_hash != 0 && reg_archive.registry_hash != 0 &&
+                reg_archive.registry_hash != pkg.manifest.world_desc.registry_hash) {
                 throw std::runtime_error("[bsvx]: Parser: registry hash mismatch for region " + ref.absolute_path.string());
             }
 
             RegionAsset asset{};
             asset.ref = ref;
-            asset.archive = std::move(*reg_archive);
+            asset.archive = std::move(reg_archive);
             pkg.regions.push_back(std::move(asset));
         }
 
@@ -1008,11 +1097,44 @@ namespace bsvx {
         }
     }
 
-    void Parser::save_region(const WorldPackage& package, const std::filesystem::path& region_path_in)
+    bvx::Archive Parser::build_standalone_region(const WorldPackage& package, std::vector<std::filesystem::path>* out_texture_file_names)
     {
         if (package.regions.size() != 1) {
             throw std::runtime_error("[bsvx]: Parser: save_standalone_region expects exactly one region");
         }
+
+        bvx::WorldDesc world_desc = package.manifest.world_desc;
+        world_desc.manifest_hash = 0;
+        world_desc.registry_hash = compute_registry_hash(world_desc);
+        world_desc.texture_refs.clear();
+
+        for (size_t i = 0; i < package.textures.size(); ++i) {
+            const std::filesystem::path file_name = choose_texture_relative_path(package.textures[i], i).filename();
+            world_desc.texture_refs.push_back(make_btx_ref(file_name.generic_string(), package.textures[i].ref.content_hash));
+            if (out_texture_file_names) out_texture_file_names->push_back(file_name);
+        }
+
+        bvx::Archive archive = package.regions.front().archive;
+        archive.set_world_desc(world_desc);
+        if (package.regions.front().ref.coord) {
+            archive.region_x = (*package.regions.front().ref.coord)[0];
+            archive.region_y = (*package.regions.front().ref.coord)[1];
+            archive.region_z = (*package.regions.front().ref.coord)[2];
+        }
+        archive.manifest_hash = 0;
+        archive.registry_hash = world_desc.registry_hash;
+        return archive;
+    }
+
+    std::vector<std::byte> Parser::save_region_to_bytes(const WorldPackage& package)
+    {
+        return build_standalone_region(package, nullptr).serialize_to_bytes();
+    }
+
+    void Parser::save_region(const WorldPackage& package, const std::filesystem::path& region_path_in)
+    {
+        std::vector<std::filesystem::path> texture_file_names;
+        const bvx::Archive archive = build_standalone_region(package, &texture_file_names);
 
         std::filesystem::path region_path = region_path_in;
         if (!region_path.has_extension()) {
@@ -1025,31 +1147,12 @@ namespace bsvx {
         const auto root_dir = region_path.parent_path();
         std::filesystem::create_directories(root_dir);
 
-        bvx::WorldDesc world_desc = package.manifest.world_desc;
-        world_desc.manifest_hash = 0;
-        world_desc.registry_hash = compute_registry_hash(world_desc);
-        world_desc.texture_refs.clear();
-
         for (size_t i = 0; i < package.textures.size(); ++i) {
-            const auto& asset = package.textures[i];
-            const std::filesystem::path file_name = choose_texture_relative_path(asset, i).filename();
-            world_desc.texture_refs.push_back(make_btx_ref(file_name.generic_string(), asset.ref.content_hash));
-
-            const auto out_path = (root_dir / file_name).lexically_normal();
-            if (!asset.archive.save_to_file(out_path.string())) {
+            const auto out_path = (root_dir / texture_file_names[i]).lexically_normal();
+            if (!package.textures[i].archive.save_to_file(out_path.string())) {
                 throw std::runtime_error("[bsvx]: Parser: failed writing standalone .btx: " + out_path.string());
             }
         }
-
-        bvx::Archive archive = package.regions.front().archive;
-        archive.set_world_desc(world_desc);
-        if (package.regions.front().ref.coord) {
-            archive.region_x = (*package.regions.front().ref.coord)[0];
-            archive.region_y = (*package.regions.front().ref.coord)[1];
-            archive.region_z = (*package.regions.front().ref.coord)[2];
-        }
-        archive.manifest_hash = 0;
-        archive.registry_hash = world_desc.registry_hash;
 
         ensure_parent_dir(region_path);
         if (!archive.save_to_file(region_path.string())) {

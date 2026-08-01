@@ -1,4 +1,6 @@
 #include "btx.h"
+#include <algorithm>
+#include <sstream>
 
 namespace bsvx::btx{
 
@@ -302,6 +304,11 @@ namespace bsvx::btx{
 	std::optional<Archive> Archive::load_from_file(const std::string& path) {
 		std::ifstream is(path, std::ios::binary);
 		if (!is) return std::nullopt;
+		return deserialize(is);
+	}
+
+	Archive Archive::load_from_memory(std::span<const std::byte> bytes) {
+		std::istringstream is(std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()), std::ios::binary);
 		return deserialize(is);
 	}
 

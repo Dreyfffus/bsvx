@@ -1,9 +1,28 @@
 #include "bvx.h"
 #include "codec.h"
+#include <algorithm>
+#include <map>
 #include <string_view>
 #include <unordered_map>
 
+// Positional reads keep concurrent chunk fetches off a shared file position. Anything without
+// pread (Windows) falls back to a mutex-guarded ifstream below.
+#if !defined(_WIN32) && (defined(__unix__) || defined(__APPLE__))
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#define BSVX_HAS_PREAD 1
+#endif
+
 namespace bsvx::bvx {
+
+	RegistryLookup build_registry_lookup(const WorldDesc& desc)
+	{
+		RegistryLookup lookup;
+		lookup.reserve(desc.registry_entries.size());
+		for (const RegistryEntry& reg : desc.registry_entries) lookup.emplace(reg.voxel_key, reg);
+		return lookup;
+	}
 
 	void Archive::set_world_desc(WorldDesc desc)
 	{
@@ -15,17 +34,31 @@ namespace bsvx::bvx {
 	{
 		return uint64_t{ x } | (uint64_t{ y } << 16u) | (uint64_t{ z } << 32u);
 	}
-	uint32_t Archive::find_chunk_index(uint16_t x, uint16_t y, uint16_t z) const
+	void Archive::rebuild_chunk_index()
 	{
-		const uint64_t key = make_chunk_key(x, y, z);
+		chunk_index_.clear();
+		chunk_index_.reserve(chunk_map.size());
 		for (uint32_t i = 0; i < chunk_map.size(); i++) {
 			const auto& c = chunk_map[i];
-			if (make_chunk_key(c.local_chunk_x, c.local_chunk_y, c.local_chunk_z) == key) return i;
+			chunk_index_.emplace(make_chunk_key(c.local_chunk_x, c.local_chunk_y, c.local_chunk_z), i);
 		}
+	}
+	uint32_t Archive::find_chunk_index(uint16_t x, uint16_t y, uint16_t z) const
+	{
+		if (auto found = try_find_chunk_index(x, y, z)) return *found;
 		throw std::runtime_error("[bvx]: chunk not found");
 	}
 	std::optional<uint32_t> Archive::try_find_chunk_index(uint16_t x, uint16_t y, uint16_t z) const
 	{
+		// The index is kept in sync by every mutator, so a const lookup never writes to it and
+		// concurrent decodes of the same archive stay safe.
+		if (chunk_index_.size() == chunk_map.size()) {
+			const auto it = chunk_index_.find(make_chunk_key(x, y, z));
+			if (it == chunk_index_.end()) return std::nullopt;
+			return it->second;
+		}
+
+		// chunk_map was edited behind our back; fall back to a scan rather than lie about it.
 		const uint64_t key = make_chunk_key(x, y, z);
 		for (uint32_t i = 0; i < chunk_map.size(); i++) {
 			const auto& c = chunk_map[i];
@@ -44,12 +77,14 @@ namespace bsvx::bvx {
 		entry.flags = to_underlying(ChunkFlags::PRESENT);
 		entry.summary_index = static_cast<uint32_t>(chunk_summaries.size());
 
+		const uint32_t index = static_cast<uint32_t>(chunk_map.size());
 		chunk_map.push_back(entry);
 		chunk_summaries.push_back({});
+		chunk_index_.emplace(make_chunk_key(x, y, z), index);
 
 		for (PayloadSection& sec : sections) if (sec.chunk_associated) sec.entries.push_back({});
 
-		return static_cast<uint32_t>(chunk_map.size() - 1);
+		return index;
 	}
 	PayloadSection& Archive::get_or_create_chunk_section(SectionType type, uint16_t default_codec)
 	{
@@ -79,16 +114,12 @@ namespace bsvx::bvx {
 	{
 		return static_cast<size_t>(g.chunk_size_x) * g.chunk_size_y * g.chunk_size_z;
 	}
-	std::unordered_map<uint32_t, RegistryEntry> Archive::build_registry_lookup() const
+	RegistryLookup Archive::build_registry_lookup() const
 	{
-		std::unordered_map<uint32_t, RegistryEntry> lookup;
-		if (!standalone) return lookup;
-		lookup.reserve(standalone->registry_entries.size());
-		for (const RegistryEntry& reg : standalone->registry_entries) lookup.emplace(reg.voxel_key, reg);
-		return lookup;
-
+		if (!standalone) return {};
+		return bvx::build_registry_lookup(*standalone);
 	}
-	void Archive::set_chunk_voxels_dense(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, std::span<const uint32_t> dense, const GeometryDesc* geometry_override, VoxelCodec req_codec)
+	void Archive::set_chunk_voxels_dense(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, std::span<const uint32_t> dense, const GeometryDesc* geometry_override, VoxelCodec req_codec, const RegistryLookup* registry_override)
 	{
 		const GeometryDesc g = resolve_geometry(geometry_override);
 		if (dense.size() != chunk_voxel_count(g)) throw std::runtime_error("[bvx]: dense chunk voxel count mismatch");
@@ -121,8 +152,12 @@ namespace bsvx::bvx {
 			.codec = static_cast<uint16_t>(payload.codec)
 		};
 
-		const auto registry_lookup = build_registry_lookup();
-		const auto* registry_ptr = registry_lookup.empty() ? nullptr : &registry_lookup;
+		// A region that belongs to a manifest world has no registry of its own. Without the caller's
+		// lookup every non-air voxel would be counted as opaque and the emissive/special counts
+		// would be silently zeroed on write.
+		const RegistryLookup owned_lookup = registry_override ? RegistryLookup{} : build_registry_lookup();
+		const RegistryLookup* registry_ptr = registry_override ? registry_override : &owned_lookup;
+		if (registry_ptr->empty()) registry_ptr = nullptr;
 		chunk_summaries[chunk_map[chunk_index].summary_index] = build_chunk_summary(dense, g.chunk_size_x, g.chunk_size_y, g.chunk_size_z, registry_ptr);
 
 		auto& cmap = chunk_map[chunk_index];
@@ -154,6 +189,22 @@ namespace bsvx::bvx {
 		default: break;
 		}
 	}
+	std::optional<std::span<const std::byte>> Archive::get_chunk_payload(SectionType type, uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, uint16_t* out_codec, uint16_t* out_entry_flags) const
+	{
+		const auto chunk_index = try_find_chunk_index(chunk_x, chunk_y, chunk_z);
+		if (!chunk_index) throw std::runtime_error("[bvx]: get_chunk_payload chunk not found");
+
+		const PayloadSection* sec = find_section(type);
+		if (!sec || *chunk_index >= sec->entries.size()) return std::nullopt;
+
+		const OffsetSizeEntry& entry = sec->entries[*chunk_index];
+		if (entry.offset == INVALID_OFFSET) return std::nullopt;
+		if (entry.offset > sec->blob.size() || entry.size > sec->blob.size() - entry.offset) throw std::runtime_error("[bvx]: payload entry out of bounds");
+
+		if (out_codec) *out_codec = entry.codec;
+		if (out_entry_flags) *out_entry_flags = entry.flags;
+		return std::span<const std::byte>(sec->blob.data() + entry.offset, entry.size);
+	}
 	std::vector<uint32_t> Archive::decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const GeometryDesc* geometry_override) const
 	{
 		const GeometryDesc g = resolve_geometry(geometry_override);
@@ -173,6 +224,53 @@ namespace bsvx::bvx {
 		const auto payload = std::span(voxels->blob.data() + entry.offset, entry.size);
 		return decode_voxel_payload(static_cast<VoxelCodec>(entry.codec), payload, g.chunk_size_x, g.chunk_size_y, g.chunk_size_z);
 
+	}
+	size_t Archive::reclaimable_bytes() const
+	{
+		size_t reclaimable = 0;
+		for (const PayloadSection& sec : sections) {
+			std::map<std::pair<uint64_t, uint32_t>, bool> live;
+			size_t live_bytes = 0;
+			for (const OffsetSizeEntry& e : sec.entries) {
+				if (e.offset == INVALID_OFFSET) continue;
+				if (e.offset > sec.blob.size() || e.size > sec.blob.size() - e.offset) continue;
+				if (live.emplace(std::pair{ e.offset, e.size }, true).second) live_bytes += e.size;
+			}
+			reclaimable += sec.blob.size() - std::min(live_bytes, sec.blob.size());
+		}
+		return reclaimable;
+	}
+	size_t Archive::compact()
+	{
+		size_t reclaimed = 0;
+		for (PayloadSection& sec : sections) {
+			std::vector<std::byte> rebuilt;
+			rebuilt.reserve(sec.blob.size());
+
+			// Entries pointing at the same range (a chunk written twice with identical bytes, or
+			// aliased payloads) collapse onto one copy.
+			std::map<std::pair<uint64_t, uint32_t>, uint64_t> moved;
+			for (OffsetSizeEntry& e : sec.entries) {
+				if (e.offset == INVALID_OFFSET) continue;
+				if (e.offset > sec.blob.size() || e.size > sec.blob.size() - e.offset) throw std::runtime_error("[bvx]: compact: payload entry out of bounds");
+
+				const auto key = std::pair{ e.offset, e.size };
+				if (const auto it = moved.find(key); it != moved.end()) {
+					e.offset = it->second;
+					continue;
+				}
+
+				const uint64_t new_offset = static_cast<uint64_t>(rebuilt.size());
+				rebuilt.insert(rebuilt.end(), sec.blob.begin() + static_cast<ptrdiff_t>(e.offset), sec.blob.begin() + static_cast<ptrdiff_t>(e.offset + e.size));
+				moved.emplace(key, new_offset);
+				e.offset = new_offset;
+			}
+
+			reclaimed += sec.blob.size() - rebuilt.size();
+			rebuilt.shrink_to_fit();
+			sec.blob = std::move(rebuilt);
+		}
+		return reclaimed;
 	}
 	std::vector<std::byte> Archive::serialize_to_bytes() const
 	{
@@ -270,14 +368,14 @@ namespace bsvx::bvx {
 		os.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 		if (!os) throw std::runtime_error("[bvx]: write failed");
 	}
-	bool Archive::save_to_file(const std::string& path) const 
+	bool Archive::save_to_file(const std::string& path) const
 	{
 		std::ofstream os(path, std::ios::binary);
 		if (!os) return false;
 		serialize(os);
 		return static_cast<bool>(os);
 	}
-	Archive Archive::deserialize(std::span<const std::byte> bytes) 
+	Archive Archive::deserialize(std::span<const std::byte> bytes)
 	{
 		if (bytes.size() < sizeof(DiskHeader)) {
 			throw std::runtime_error("[bvx]: file too small");
@@ -356,6 +454,7 @@ namespace bsvx::bvx {
 
 		if ((header.flags & to_underlying(FileFlags::STANDALONE)) != 0u && !out.standalone) throw std::runtime_error("[bvx]: standalone flag set but WORLD_DESC section missing");
 
+		out.rebuild_chunk_index();
 		return out;
 	}
 	Archive Archive::deserialize(std::istream& is)
@@ -377,6 +476,10 @@ namespace bsvx::bvx {
 		if (!is) return std::nullopt;
 		return std::optional<Archive>{deserialize(is)};
 	}
+	Archive Archive::load_from_memory(std::span<const std::byte> bytes)
+	{
+		return deserialize(bytes);
+	}
 
 	BtxRef Archive::make_btx_ref(std::string_view relative_path, uint64_t content_hash)
 	{
@@ -397,5 +500,256 @@ namespace bsvx::bvx {
 		e.flags = to_underlying(flags);
 		e.name_hash = name.empty() ? 0 : fnv1a64(name);
 		return e;
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// Byte sources
+	// -------------------------------------------------------------------------------------------
+
+	MemoryByteSource::MemoryByteSource(std::span<const std::byte> bytes, bool copy)
+	{
+		if (copy) {
+			owned_.assign(bytes.begin(), bytes.end());
+			view_ = std::span<const std::byte>(owned_.data(), owned_.size());
+		}
+		else {
+			view_ = bytes;
+		}
+	}
+	uint64_t MemoryByteSource::size() const
+	{
+		return static_cast<uint64_t>(view_.size());
+	}
+	void MemoryByteSource::read(uint64_t offset, std::span<std::byte> dst) const
+	{
+		if (offset > view_.size() || dst.size() > view_.size() - offset) throw std::runtime_error("[bvx]: memory source read out of bounds");
+		if (!dst.empty()) std::memcpy(dst.data(), view_.data() + offset, dst.size());
+	}
+
+#if defined(BSVX_HAS_PREAD)
+	struct FileByteSource::Impl {
+		int fd = -1;
+		~Impl() { if (fd >= 0) ::close(fd); }
+	};
+
+	FileByteSource::FileByteSource(const std::string& path)
+		: impl_(std::make_unique<Impl>())
+	{
+		impl_->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+		if (impl_->fd < 0) throw std::runtime_error("[bvx]: could not open region file: " + path);
+
+		const off_t end = ::lseek(impl_->fd, 0, SEEK_END);
+		if (end < 0) throw std::runtime_error("[bvx]: failed to query region file size: " + path);
+		size_ = static_cast<uint64_t>(end);
+	}
+	FileByteSource::~FileByteSource() = default;
+	void FileByteSource::read(uint64_t offset, std::span<std::byte> dst) const
+	{
+		if (offset > size_ || dst.size() > size_ - offset) throw std::runtime_error("[bvx]: file source read out of bounds");
+
+		// pread carries its own offset, so concurrent reads need no lock at all.
+		size_t done = 0;
+		while (done < dst.size()) {
+			const ssize_t n = ::pread(impl_->fd, dst.data() + done, dst.size() - done, static_cast<off_t>(offset + done));
+			if (n < 0) {
+				if (errno == EINTR) continue;
+				throw std::runtime_error("[bvx]: region file read failed");
+			}
+			if (n == 0) throw std::runtime_error("[bvx]: unexpected end of region file");
+			done += static_cast<size_t>(n);
+		}
+	}
+#else
+	struct FileByteSource::Impl {
+		std::mutex mutex;
+		std::ifstream stream;
+		explicit Impl(const std::string& path) : stream(path, std::ios::binary) {}
+	};
+
+	FileByteSource::FileByteSource(const std::string& path)
+		: impl_(std::make_unique<Impl>(path))
+	{
+		if (!impl_->stream) throw std::runtime_error("[bvx]: could not open region file: " + path);
+		impl_->stream.seekg(0, std::ios::end);
+		const auto end = impl_->stream.tellg();
+		if (end < 0) throw std::runtime_error("[bvx]: failed to query region file size: " + path);
+		size_ = static_cast<uint64_t>(end);
+	}
+	FileByteSource::~FileByteSource() = default;
+	void FileByteSource::read(uint64_t offset, std::span<std::byte> dst) const
+	{
+		if (offset > size_ || dst.size() > size_ - offset) throw std::runtime_error("[bvx]: file source read out of bounds");
+		if (dst.empty()) return;
+
+		// One ifstream shared by every reader thread, so the seek+read pair has to be atomic.
+		const std::lock_guard<std::mutex> guard(impl_->mutex);
+		impl_->stream.clear();
+		impl_->stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+		impl_->stream.read(reinterpret_cast<char*>(dst.data()), static_cast<std::streamsize>(dst.size()));
+		if (!impl_->stream) throw std::runtime_error("[bvx]: region file read failed");
+	}
+#endif
+	uint64_t FileByteSource::size() const
+	{
+		return size_;
+	}
+
+	// -------------------------------------------------------------------------------------------
+	// RegionReader
+	// -------------------------------------------------------------------------------------------
+
+	namespace {
+		template <TriviallySerializable T>
+		std::vector<T> read_table(const ByteSource& src, uint64_t offset, size_t count, const char* what)
+		{
+			const uint64_t bytes = static_cast<uint64_t>(count) * sizeof(T);
+			if (offset > src.size() || bytes > src.size() - offset) throw std::runtime_error(std::string("[bvx]: out-of-bounds ") + what);
+			std::vector<T> out(count);
+			if (count != 0) src.read(offset, std::as_writable_bytes(std::span<T>(out.data(), out.size())));
+			return out;
+		}
+	}
+
+	RegionReader RegionReader::open(std::shared_ptr<ByteSource> source)
+	{
+		if (!source) throw std::invalid_argument("[bvx]: RegionReader requires a byte source");
+
+		RegionReader out{};
+		out.source_ = std::move(source);
+		const ByteSource& src = *out.source_;
+
+		if (src.size() < sizeof(DiskHeader)) throw std::runtime_error("[bvx]: file too small");
+		src.read(0, std::as_writable_bytes(std::span(&out.header_, 1)));
+
+		const DiskHeader& header = out.header_;
+		if (header.magic != BVX_MAGIC) throw std::runtime_error("[bvx]: black magic, unsupported file type");
+		if (header.version != BVX_VERSION) throw std::runtime_error("[bvx]: unsupported version");
+		if (header.file_size != src.size()) throw std::runtime_error("[bvx]: file size mismatch");
+
+		out.chunk_map_ = read_table<ChunkMapEntry>(src, header.chunk_map_offset, header.chunk_count, "chunk map");
+		out.chunk_summaries_ = read_table<ChunkSummary>(src, header.summary_table_offset, header.chunk_count, "summary table");
+		out.directory_ = read_table<SectionRecord>(src, header.section_dir_offset, header.section_count, "section directory");
+
+		out.entries_.resize(out.directory_.size());
+		for (size_t i = 0; i < out.directory_.size(); ++i) {
+			const SectionRecord& rec = out.directory_[i];
+			if (rec.entry_stride != sizeof(OffsetSizeEntry)) throw std::runtime_error("[bvx]: unsupported section entry stride");
+			if (rec.blob_offset > src.size() || rec.blob_size > src.size() - rec.blob_offset) throw std::runtime_error("[bvx]: out-of-bounds section blob");
+
+			out.entries_[i] = read_table<OffsetSizeEntry>(src, rec.entry_table_offset, rec.entry_count, "section entry table");
+
+			// The world desc is metadata, not a payload -- it carries the geometry needed to decode
+			// anything else, so it is the one blob read up front.
+			if (static_cast<SectionType>(rec.section_type) == SectionType::WORLD_DESC) {
+				if (out.entries_[i].size() != 1 || out.entries_[i][0].offset != 0 || out.entries_[i][0].size != rec.blob_size) throw std::runtime_error("[bvx]: malformed world desc section");
+				std::vector<std::byte> blob(static_cast<size_t>(rec.blob_size));
+				if (!blob.empty()) src.read(rec.blob_offset, std::span<std::byte>(blob.data(), blob.size()));
+				out.standalone_ = parse_world_desc_blob(blob);
+			}
+		}
+
+		if ((header.flags & to_underlying(FileFlags::STANDALONE)) != 0u && !out.standalone_) throw std::runtime_error("[bvx]: standalone flag set but WORLD_DESC section missing");
+
+		out.chunk_index_.reserve(out.chunk_map_.size());
+		for (uint32_t i = 0; i < out.chunk_map_.size(); ++i) {
+			const ChunkMapEntry& c = out.chunk_map_[i];
+			out.chunk_index_.emplace(Archive::make_chunk_key(c.local_chunk_x, c.local_chunk_y, c.local_chunk_z), i);
+		}
+
+		return out;
+	}
+	RegionReader RegionReader::open_file(const std::string& path)
+	{
+		return open(std::make_shared<FileByteSource>(path));
+	}
+	RegionReader RegionReader::open_memory(std::span<const std::byte> bytes, bool copy)
+	{
+		return open(std::make_shared<MemoryByteSource>(bytes, copy));
+	}
+	GeometryDesc RegionReader::resolve_geometry() const
+	{
+		if (standalone_) return standalone_->geometry;
+		if (geometry_override_) return *geometry_override_;
+		throw std::runtime_error("[bvx]: region carries no geometry; call set_geometry_override with the world's geometry first");
+	}
+	std::optional<uint32_t> RegionReader::try_find_chunk_index(uint16_t x, uint16_t y, uint16_t z) const
+	{
+		const auto it = chunk_index_.find(Archive::make_chunk_key(x, y, z));
+		if (it == chunk_index_.end()) return std::nullopt;
+		return it->second;
+	}
+	const OffsetSizeEntry* RegionReader::find_chunk_entry(SectionType type, uint32_t chunk_index) const
+	{
+		for (size_t i = 0; i < directory_.size(); ++i) {
+			if (static_cast<SectionType>(directory_[i].section_type) != type) continue;
+			if (chunk_index >= entries_[i].size()) return nullptr;
+			const OffsetSizeEntry& entry = entries_[i][chunk_index];
+			return entry.offset == INVALID_OFFSET ? nullptr : &entry;
+		}
+		return nullptr;
+	}
+	std::optional<std::vector<std::byte>> RegionReader::read_chunk_payload(SectionType type, uint32_t chunk_index, uint16_t* out_codec, uint16_t* out_entry_flags) const
+	{
+		for (size_t i = 0; i < directory_.size(); ++i) {
+			if (static_cast<SectionType>(directory_[i].section_type) != type) continue;
+			if (chunk_index >= entries_[i].size()) return std::nullopt;
+
+			const OffsetSizeEntry& entry = entries_[i][chunk_index];
+			if (entry.offset == INVALID_OFFSET) return std::nullopt;
+
+			const SectionRecord& rec = directory_[i];
+			if (entry.offset > rec.blob_size || entry.size > rec.blob_size - entry.offset) throw std::runtime_error("[bvx]: payload entry out of bounds");
+
+			std::vector<std::byte> payload(entry.size);
+			if (!payload.empty()) source_->read(rec.blob_offset + entry.offset, std::span<std::byte>(payload.data(), payload.size()));
+
+			if (out_codec) *out_codec = entry.codec;
+			if (out_entry_flags) *out_entry_flags = entry.flags;
+			return payload;
+		}
+		return std::nullopt;
+	}
+	std::vector<uint32_t> RegionReader::decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z) const
+	{
+		const GeometryDesc g = resolve_geometry();
+		const size_t voxel_count = Archive::chunk_voxel_count(g);
+
+		const auto chunk_index = try_find_chunk_index(chunk_x, chunk_y, chunk_z);
+		if (!chunk_index) throw std::runtime_error("[bvx]: decode_chunk_voxels chunk not found");
+
+		uint16_t codec = 0;
+		const auto payload = read_chunk_payload(SectionType::VOXELS, *chunk_index, &codec);
+		if (!payload) return std::vector<uint32_t>(voxel_count, 0u);
+
+		return decode_voxel_payload(static_cast<VoxelCodec>(codec), std::span<const std::byte>(payload->data(), payload->size()), g.chunk_size_x, g.chunk_size_y, g.chunk_size_z);
+	}
+	bool RegionReader::verify_integrity() const
+	{
+		std::vector<std::byte> bytes(static_cast<size_t>(source_->size()));
+		if (bytes.empty()) return false;
+		source_->read(0, std::span<std::byte>(bytes.data(), bytes.size()));
+
+		const uint64_t expected = reinterpret_cast<const DiskHeader*>(bytes.data())->crc64;
+		reinterpret_cast<DiskHeader*>(bytes.data())->crc64 = 0;
+		return fnv1a64(std::span<const std::byte>(bytes.data(), bytes.size())) == expected;
+	}
+	Archive RegionReader::load_full() const
+	{
+		std::vector<std::byte> bytes(static_cast<size_t>(source_->size()));
+		if (!bytes.empty()) source_->read(0, std::span<std::byte>(bytes.data(), bytes.size()));
+		return Archive::deserialize(std::span<const std::byte>(bytes.data(), bytes.size()));
+	}
+	uint64_t RegionReader::resident_bytes() const noexcept
+	{
+		uint64_t total = sizeof(DiskHeader);
+		total += chunk_map_.size() * sizeof(ChunkMapEntry);
+		total += chunk_summaries_.size() * sizeof(ChunkSummary);
+		total += directory_.size() * sizeof(SectionRecord);
+		for (const auto& table : entries_) total += table.size() * sizeof(OffsetSizeEntry);
+		if (standalone_) {
+			total += standalone_->texture_refs.size() * sizeof(BtxRef);
+			total += standalone_->registry_entries.size() * sizeof(RegistryEntry);
+		}
+		return total;
 	}
 }

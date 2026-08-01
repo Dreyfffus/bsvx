@@ -39,6 +39,8 @@ namespace bsvx::btx {
 		);
 		bool save_to_file(const std::string& path) const;
 		static std::optional<Archive> load_from_file(const std::string& path);
+		// Same checks as load_from_file, for bytes that never came from the native filesystem.
+		static Archive load_from_memory(std::span<const std::byte> bytes);
 		std::vector<ValidationError> validate() const;
 	private:
 
