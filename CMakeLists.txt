@@ -15,6 +15,23 @@ target_include_directories(bsvx
 target_compile_definitions(bsvx PRIVATE TOML_HEADER_ONLY=0 BSVX_ASSETS_BUILD_DLL)
 set_target_properties(bsvx PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
 
+set_source_files_properties(
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/impl/toml_impl.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/impl/toml.hpp"
+  PROPERTIES COMPILE_OPTIONS "-Wno-deprecated-literal-operator"
+)
+
+message(STATUS "Writing .clangd to ${CMAKE_CURRENT_SOURCE_DIR}/.clangd")
+file(RELATIVE_PATH CLANGD_BUILD_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}"
+)
+
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/.clangd.in"
+  "${CMAKE_CURRENT_SOURCE_DIR}/.clangd"
+  @ONLY
+)
+
 option(BSVX_BUILD_TESTS "Build the fixture-driven test runner" ON)
 if(BSVX_BUILD_TESTS)
     add_executable(bsvx_tests "${CMAKE_CURRENT_SOURCE_DIR}/test/tests.cpp")

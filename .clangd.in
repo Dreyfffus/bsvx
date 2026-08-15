@@ -1,0 +1,11 @@
+CompileFlags:
+  CompilationDatabase: @CLANGD_BUILD_DIR@
+  Add:
+    - -std=c++23
+    - -I@CMAKE_CURRENT_SOURCE_DIR@/src/include
+    - -I@CMAKE_CURRENT_SOURCE_DIR@/src/impl
+    - -DTOML_HEADER_ONLY=0
+    - -DBSVX_ASSETS_BUILD_DLL
+Diagnostics: 
+  Suppress:
+    - unused-includes

@@ -428,3 +428,6 @@ cmake-build-*/
 # Artifacts of the documented one-liner g++ build
 /libbsvx.so
 /bsvx_tests
+
+.clangd
+.clang-format
