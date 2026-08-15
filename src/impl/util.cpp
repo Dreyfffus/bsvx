@@ -33,12 +33,12 @@ namespace bsvx {
 	void write_file_direct(const std::filesystem::path& path, std::span<const std::byte> bytes)
 	{
 		std::ofstream os(path, std::ios::binary | std::ios::trunc);
-		if (!os) throw std::runtime_error("[bsvx]: could not open for writing: " + path.string());
+		if (!os) throw std::runtime_error("[bsvx]: could not open for writing: " + path_to_utf8(path));
 		if (!bytes.empty()) {
 			os.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 		}
 		os.close();
-		if (!os) throw std::runtime_error("[bsvx]: failed writing: " + path.string());
+		if (!os) throw std::runtime_error("[bsvx]: failed writing: " + path_to_utf8(path));
 	}
 
 	void write_file_atomic(const std::filesystem::path& path, std::span<const std::byte> bytes, bool backup)

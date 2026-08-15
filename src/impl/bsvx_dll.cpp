@@ -2793,7 +2793,7 @@ extern "C" {
                 return BSVX_RESULT_INVALID_ARGUMENT;
             }
 
-            const std::string id = (texture_id && texture_id[0] != '\0') ? texture_id : bsvx::path_from_utf8(relative_path).stem().string();
+            const std::string id = (texture_id && texture_id[0] != '\0') ? texture_id : bsvx::path_to_utf8(bsvx::path_from_utf8(relative_path).stem());
 
             std::filesystem::path path = (relative_path && relative_path[0] != '\0') ? bsvx::path_from_utf8(relative_path) : std::filesystem::path(id);
             if (path.is_absolute()) return BSVX_RESULT_INVALID_ARGUMENT;

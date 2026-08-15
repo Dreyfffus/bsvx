@@ -117,16 +117,32 @@ namespace {
         bsvx_region_reader* reader_ = nullptr;
     };
 
+    // The tests speak UTF-8 to the C API, so they need the same conversions the library uses.
+    // path::string() must not be used for this: on MSVC it narrows through the ACTIVE CODE PAGE and
+    // throws std::system_error for anything it cannot represent, so a non-ASCII temp directory would
+    // take the whole suite down.
+    std::string u8_to_string(const char8_t* text)
+    {
+        const std::u8string owned(text);
+        return std::string(reinterpret_cast<const char*>(owned.data()), owned.size());
+    }
+
+    std::string path_to_utf8_string(const fs::path& path)
+    {
+        const std::u8string owned = path.generic_u8string();
+        return std::string(reinterpret_cast<const char*>(owned.data()), owned.size());
+    }
+
     std::vector<unsigned char> read_file_bytes(const fs::path& path)
     {
         std::ifstream is(path, std::ios::binary);
-        if (!is) throw TestFailure("could not open " + path.string());
+        if (!is) throw TestFailure("could not open " + path_to_utf8_string(path));
         is.seekg(0, std::ios::end);
         const auto size = static_cast<size_t>(is.tellg());
         is.seekg(0, std::ios::beg);
         std::vector<unsigned char> bytes(size);
         if (size != 0) is.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
-        if (!is) throw TestFailure("could not read " + path.string());
+        if (!is) throw TestFailure("could not read " + path_to_utf8_string(path));
         return bytes;
     }
 
@@ -138,7 +154,7 @@ namespace {
     World load_world(Context& ctx, const fs::path& path)
     {
         bsvx_world* raw = nullptr;
-        const auto rc = bsvx_world_load(ctx.get(), path.string().c_str(), &raw);
+        const auto rc = bsvx_world_load(ctx.get(), path_to_utf8_string(path).c_str(), &raw);
         if (rc != BSVX_RESULT_OK) throw_last_error(ctx, "bsvx_world_load failed");
         REQUIRE(raw != nullptr);
         return World(raw);
@@ -147,7 +163,7 @@ namespace {
     World load_region(Context& ctx, const fs::path& path)
     {
         bsvx_world* raw = nullptr;
-        const auto rc = bsvx_world_load_region(ctx.get(), path.string().c_str(), &raw);
+        const auto rc = bsvx_world_load_region(ctx.get(), path_to_utf8_string(path).c_str(), &raw);
         if (rc != BSVX_RESULT_OK) throw_last_error(ctx, "bsvx_world_load_region failed");
         REQUIRE(raw != nullptr);
         return World(raw);
@@ -273,7 +289,7 @@ namespace {
         const auto before = decode_chunk(world, 0, info.local_chunk_x, info.local_chunk_y, info.local_chunk_z);
 
         const fs::path out_root = make_temp_dir("save_world_roundtrip");
-        REQUIRE_EQ(bsvx_world_save(world.get(), out_root.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save(world.get(), path_to_utf8_string(out_root).c_str()), BSVX_RESULT_OK);
         REQUIRE(fs::exists(out_root / "manifest.toml"));
 
         World loaded_again = load_world(ctx, out_root / "manifest.toml");
@@ -327,7 +343,7 @@ namespace {
             BSVX_RESULT_OK);
 
         const fs::path out_root = make_temp_dir("mutate_and_save");
-        REQUIRE_EQ(bsvx_world_save(world.get(), out_root.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save(world.get(), path_to_utf8_string(out_root).c_str()), BSVX_RESULT_OK);
 
         World loaded_again = load_world(ctx, out_root / "manifest.toml");
         const auto roundtripped = decode_chunk(loaded_again, 0, info.local_chunk_x, info.local_chunk_y, info.local_chunk_z);
@@ -379,7 +395,7 @@ namespace {
         bsvx_world* with_tex = nullptr;
         REQUIRE_EQ(
             bsvx_world_load_region_memory_ex(ctx.get(), bytes.data(), bytes.size(),
-                region.parent_path().string().c_str(), &with_tex),
+                path_to_utf8_string(region.parent_path()).c_str(), &with_tex),
             BSVX_RESULT_OK);
         World textured(with_tex);
         REQUIRE(bsvx_world_texture_count(textured.get()) >= 1u);
@@ -438,7 +454,7 @@ namespace {
 
         // And it has to survive the save/reload round-trip too.
         const fs::path out_root = make_temp_dir("summary_fidelity");
-        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), out_root.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str()), BSVX_RESULT_OK);
 
         World reloaded = load_world(ctx, out_root / "manifest.toml");
         bsvx_chunk_info round_tripped{};
@@ -501,7 +517,7 @@ namespace {
 
         // Survives a save/reload.
         const fs::path out_root = make_temp_dir("payload_readback");
-        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), out_root.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str()), BSVX_RESULT_OK);
 
         World reloaded = load_world(ctx, out_root / "manifest.toml");
         std::vector<unsigned char> again(baked.size());
@@ -535,13 +551,25 @@ namespace {
             BSVX_RESULT_RUNTIME_ERROR);
         REQUIRE(!ctx.last_error().empty());
 
-        // Saving somewhere impossible must report why.
-        REQUIRE(bsvx_world_save_ex(ctx.get(), world.get(), "/proc/bsvx_does_not_exist/world") != BSVX_RESULT_OK);
+        // Saving somewhere impossible must report why. The destination has to be one no platform
+        // can create: "/proc/..." only fails on Linux -- on Windows a leading slash means "root of
+        // the current drive", so it resolves to a perfectly creatable D:\proc\... A path leading
+        // *through* a regular file cannot be created as a directory anywhere.
+        const fs::path blocked_root = make_temp_dir("error_reporting_blocked");
+        const fs::path blocker = blocked_root / "not_a_directory";
+        {
+            std::ofstream os(blocker, std::ios::binary);
+            os << "x";
+        }
+        REQUIRE(fs::is_regular_file(blocker));
+
+        const fs::path impossible = blocker / "world";
+        REQUIRE(bsvx_world_save_ex(ctx.get(), world.get(), path_to_utf8_string(impossible).c_str()) != BSVX_RESULT_OK);
         REQUIRE(!ctx.last_error().empty());
 
         // A successful call clears the previous message.
         const fs::path out_root = make_temp_dir("error_reporting");
-        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), out_root.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str()), BSVX_RESULT_OK);
         REQUIRE(ctx.last_error().empty());
     }
 
@@ -569,7 +597,7 @@ namespace {
         REQUIRE(reclaimable > 0u);
 
         const fs::path fat_root = make_temp_dir("compaction_fat");
-        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), fat_root.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), path_to_utf8_string(fat_root).c_str()), BSVX_RESULT_OK);
         const auto fat_size = fs::file_size(fat_root / "regions" / "r_0_0_0.bvx");
 
         size_t reclaimed = 0;
@@ -582,7 +610,7 @@ namespace {
         REQUIRE(after == dense);
 
         const fs::path lean_root = make_temp_dir("compaction_lean");
-        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), lean_root.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), path_to_utf8_string(lean_root).c_str()), BSVX_RESULT_OK);
         const auto lean_size = fs::file_size(lean_root / "regions" / "r_0_0_0.bvx");
         REQUIRE(lean_size < fat_size);
 
@@ -600,7 +628,7 @@ namespace {
         World eager = load_region(ctx, region);
 
         bsvx_region_reader* raw = nullptr;
-        if (bsvx_region_reader_open(ctx.get(), region.string().c_str(), &raw) != BSVX_RESULT_OK) {
+        if (bsvx_region_reader_open(ctx.get(), path_to_utf8_string(region).c_str(), &raw) != BSVX_RESULT_OK) {
             throw_last_error(ctx, "bsvx_region_reader_open failed");
         }
         Reader reader(raw);
@@ -756,10 +784,10 @@ namespace {
 
         const fs::path out_dir = make_temp_dir("reader_payload");
         const fs::path out_region = out_dir / "region.bvx";
-        REQUIRE_EQ(bsvx_world_save_region_ex(ctx.get(), world.get(), out_region.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_region_ex(ctx.get(), world.get(), path_to_utf8_string(out_region).c_str()), BSVX_RESULT_OK);
 
         bsvx_region_reader* raw = nullptr;
-        if (bsvx_region_reader_open(ctx.get(), out_region.string().c_str(), &raw) != BSVX_RESULT_OK) {
+        if (bsvx_region_reader_open(ctx.get(), path_to_utf8_string(out_region).c_str(), &raw) != BSVX_RESULT_OK) {
             throw_last_error(ctx, "bsvx_region_reader_open failed");
         }
         Reader reader(raw);
@@ -933,7 +961,7 @@ namespace {
         REQUIRE_EQ(info.summary.emissive_count, 1u);
 
         const fs::path out_root = make_temp_dir("authored_world");
-        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), out_root.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str()), BSVX_RESULT_OK);
         REQUIRE(fs::exists(out_root / "manifest.toml"));
         REQUIRE(fs::exists(out_root / "regions" / "r_0_0_0.bvx"));
         REQUIRE(fs::exists(out_root / "regions" / "r_1_0_0.bvx"));
@@ -976,7 +1004,7 @@ namespace {
         // Byte-identical to what save_region would have put on disk.
         const fs::path out_dir = make_temp_dir("save_region_memory");
         const fs::path out_region = out_dir / "region.bvx";
-        REQUIRE_EQ(bsvx_world_save_region_ex(ctx.get(), world.get(), out_region.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_region_ex(ctx.get(), world.get(), path_to_utf8_string(out_region).c_str()), BSVX_RESULT_OK);
         REQUIRE(read_file_bytes(out_region) == bytes);
 
         // And it loads back as a standalone region.
@@ -1037,7 +1065,7 @@ namespace {
 
         std::vector<std::string> names;
         for (const auto& entry : fs::directory_iterator(real, ec)) {
-            if (entry.is_regular_file()) names.push_back(entry.path().filename().string());
+            if (entry.is_regular_file()) names.push_back(path_to_utf8_string(entry.path().filename()));
         }
         std::sort(names.begin(), names.end());
         if (index >= names.size()) return 0;
@@ -1344,7 +1372,7 @@ namespace {
             const int64_t x = 0, y = 0, z = 0;
             const uint32_t key = 1;
             REQUIRE_EQ(bsvx_world_set_voxels(ctx.get(), world.get(), &x, &y, &z, &key, 1, 1, &written), BSVX_RESULT_OK);
-            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
         }
 
         // The regression this exists for: names used to be hashed on parse and dropped on save, so
@@ -1358,7 +1386,7 @@ namespace {
 
         // And through a standalone .bvx, which carries its own copy of the world desc.
         const fs::path region_path = out_root / "standalone.bvx";
-        REQUIRE_EQ(bsvx_world_save_region_ex(ctx.get(), reloaded.get(), region_path.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_region_ex(ctx.get(), reloaded.get(), path_to_utf8_string(region_path).c_str()), BSVX_RESULT_OK);
 
         World standalone = load_region(ctx, region_path);
         REQUIRE(get_string([&](char* b, size_t c, size_t* n) { return bsvx_world_get_registry_name(standalone.get(), 1u, b, c, n); }) == "stone");
@@ -1378,7 +1406,7 @@ namespace {
             bsvx_units zero{ 0.0, 1.0, 1.0, 0.0, 0.0, 0.0 };
             REQUIRE_EQ(bsvx_world_set_units(world.get(), &zero), BSVX_RESULT_INVALID_ARGUMENT);
 
-            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
         }
 
         World reloaded = load_world(ctx, out_root);
@@ -1405,7 +1433,7 @@ namespace {
             REQUIRE_EQ(bsvx_world_add_region(world.get(), 0, 0, 0, &region), BSVX_RESULT_OK);
             REQUIRE_EQ(bsvx_region_set_metadata(world.get(), region, "tool.object", "Terrain", 7), BSVX_RESULT_OK);
 
-            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
         }
 
         World reloaded = load_world(ctx, out_root);
@@ -1497,7 +1525,7 @@ namespace {
         size_t count = 0;
         REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 0, 0, 0, 0, 0, 0, 1u, 1, &count), BSVX_RESULT_OK);
         REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 16, 16, 16, 16, 16, 16, 1u, 1, &count), BSVX_RESULT_OK);
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
 
         const auto count_regions = [&] {
             size_t files = 0;
@@ -1514,11 +1542,11 @@ namespace {
 
         // Without pruning the file stays, and region auto-discovery finds it again on the next
         // load -- the deletion silently undoes itself.
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
         REQUIRE_EQ(count_regions(), 2u);
 
         bsvx_save_report report{};
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_PRUNE_ORPHANS, &report), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_PRUNE_ORPHANS, &report), BSVX_RESULT_OK);
         REQUIRE_EQ(report.files_removed, 1u);
         REQUIRE_EQ(count_regions(), 1u);
 
@@ -1536,7 +1564,7 @@ namespace {
             size_t count = 0;
             REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 0, 0, 0, 0, 0, 0, 1u, 1, &count), BSVX_RESULT_OK);
             REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 16, 16, 16, 16, 16, 16, 1u, 1, &count), BSVX_RESULT_OK);
-            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
         }
 
         World world = load_world(ctx, out_root);
@@ -1597,7 +1625,7 @@ namespace {
             World world = make_authoring_world(ctx);
             size_t count = 0;
             REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 0, 0, 0, 0, 0, 0, 1u, 1, &count), BSVX_RESULT_OK);
-            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+            REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
         }
 
         // Exactly what a hand edit, or a checkout that rewrote line endings, does to the world.
@@ -1607,10 +1635,10 @@ namespace {
         }
 
         bsvx_world* raw = nullptr;
-        REQUIRE(bsvx_world_load(ctx.get(), out_root.string().c_str(), &raw) != BSVX_RESULT_OK);
+        REQUIRE(bsvx_world_load(ctx.get(), path_to_utf8_string(out_root).c_str(), &raw) != BSVX_RESULT_OK);
         REQUIRE(ctx.last_error().find("manifest hash mismatch") != std::string::npos);
 
-        REQUIRE_EQ(bsvx_world_load_ex2(ctx.get(), out_root.string().c_str(), BSVX_LOAD_IGNORE_HASH_MISMATCH, &raw), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_load_ex2(ctx.get(), path_to_utf8_string(out_root).c_str(), BSVX_LOAD_IGNORE_HASH_MISMATCH, &raw), BSVX_RESULT_OK);
         World world(raw);
         REQUIRE_EQ(bsvx_context_warning_count(ctx.get()), 1u);
         REQUIRE(std::string(bsvx_context_warning(ctx.get(), 0)).find("manifest hash mismatch") != std::string::npos);
@@ -1618,7 +1646,7 @@ namespace {
         size_t restamped = 0;
         REQUIRE_EQ(bsvx_world_rehash(world.get(), &restamped), BSVX_RESULT_OK);
         REQUIRE_EQ(restamped, 1u);
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
 
         // Repaired: the strict path opens it again.
         World repaired = load_world(ctx, out_root);
@@ -1631,13 +1659,13 @@ namespace {
         Context ctx;
 
         bsvx_world* raw = nullptr;
-        REQUIRE_EQ(bsvx_world_load_ex2(ctx.get(), fixture_manifest().string().c_str(), BSVX_LOAD_SKIP_TEXTURES, &raw), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_load_ex2(ctx.get(), path_to_utf8_string(fixture_manifest()).c_str(), BSVX_LOAD_SKIP_TEXTURES, &raw), BSVX_RESULT_OK);
         World no_textures(raw);
         REQUIRE_EQ(bsvx_world_texture_count(no_textures.get()), 0u);
         REQUIRE(bsvx_world_region_count(no_textures.get()) > 0u);
         REQUIRE(bsvx_world_registry_entry_count(no_textures.get()) > 0u);
 
-        REQUIRE_EQ(bsvx_world_load_ex2(ctx.get(), fixture_manifest().string().c_str(), BSVX_LOAD_SKIP_REGIONS, &raw), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_load_ex2(ctx.get(), path_to_utf8_string(fixture_manifest()).c_str(), BSVX_LOAD_SKIP_REGIONS, &raw), BSVX_RESULT_OK);
         World no_regions(raw);
         REQUIRE_EQ(bsvx_world_region_count(no_regions.get()), 0u);
         REQUIRE(bsvx_world_texture_count(no_regions.get()) > 0u);
@@ -1651,21 +1679,21 @@ namespace {
         World world = make_authoring_world(ctx);
         size_t count = 0;
         REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 0, 0, 0, 0, 0, 0, 1u, 1, &count), BSVX_RESULT_OK);
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
 
         // No temp file may survive a successful save.
         for (const auto& entry : fs::recursive_directory_iterator(out_root)) {
-            REQUIRE(entry.path().string().find(".bsvx-tmp-") == std::string::npos);
+            REQUIRE(path_to_utf8_string(entry.path()).find(".bsvx-tmp-") == std::string::npos);
         }
 
         REQUIRE_EQ(bsvx_world_set_name(world.get(), "Second"), BSVX_RESULT_OK);
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_BACKUP, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_BACKUP, nullptr), BSVX_RESULT_OK);
         REQUIRE(fs::exists(out_root / "manifest.toml.bak"));
 
         // A dry run reports without touching anything.
         const fs::path dry_root = make_temp_dir("atomic_dry");
         bsvx_save_report report{};
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), dry_root.string().c_str(), BSVX_SAVE_DRY_RUN, &report), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(dry_root).c_str(), BSVX_SAVE_DRY_RUN, &report), BSVX_RESULT_OK);
         REQUIRE(report.files_written >= 2u);
         REQUIRE(report.bytes_written > 0u);
         REQUIRE(!fs::exists(dry_root / "manifest.toml"));
@@ -1876,7 +1904,7 @@ namespace {
 
         size_t count = 0;
         REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 0, 0, 0, 0, 0, 0, 1u, 1, &count), BSVX_RESULT_OK);
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
         REQUIRE(fs::exists(out_root / "textures" / "palette.btx"));
 
         // Read the authored archive back through the introspection API added in v3.
@@ -1925,7 +1953,7 @@ namespace {
         World world = make_authoring_world(ctx);
         size_t count = 0;
         REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 0, 0, 0, 0, 0, 0, 1u, 1, &count), BSVX_RESULT_OK);
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
 
         World reloaded = load_world(ctx, out_root);
         const std::string source = get_string([&](char* b, size_t c, size_t* n) { return bsvx_world_get_source_path(reloaded.get(), b, c, n); });
@@ -1943,13 +1971,13 @@ namespace {
             }, nullptr);
 
         const fs::path progress_root = make_temp_dir("progress_ok");
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), reloaded.get(), progress_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), reloaded.get(), path_to_utf8_string(progress_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
         REQUIRE(calls > 0);
 
         calls = 0;
         cancel_after = 0;
         const fs::path cancel_root = make_temp_dir("progress_cancel");
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), reloaded.get(), cancel_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_CANCELLED);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), reloaded.get(), path_to_utf8_string(cancel_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_CANCELLED);
         REQUIRE(!fs::exists(cancel_root / "manifest.toml"));
 
         bsvx_context_set_progress(ctx.get(), nullptr, nullptr);
@@ -1963,7 +1991,7 @@ namespace {
         World world = make_authoring_world(ctx);
         size_t count = 0;
         REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 0, 0, 0, 0, 0, 0, 1u, 1, &count), BSVX_RESULT_OK);
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
 
         World reloaded = load_world(ctx, out_root);
         const std::string text = get_string([&](char* b, size_t c, size_t* n) { return bsvx_world_save_manifest_memory(ctx.get(), reloaded.get(), b, c, n); });
@@ -1975,19 +2003,6 @@ namespace {
         REQUIRE(std::equal(text.begin(), text.end(), on_disk.begin()));
     }
 
-
-    // The tests speak UTF-8 to the C API, so they need the same conversions the library uses.
-    std::string u8_to_string(const char8_t* text)
-    {
-        const std::u8string owned(text);
-        return std::string(reinterpret_cast<const char*>(owned.data()), owned.size());
-    }
-
-    std::string path_to_utf8_string(const fs::path& path)
-    {
-        const std::u8string owned = path.generic_u8string();
-        return std::string(reinterpret_cast<const char*>(owned.data()), owned.size());
-    }
 
 
     /* ------------------------------------------------------------------------------------- */
@@ -2118,11 +2133,11 @@ namespace {
         REQUIRE_EQ(bsvx_texture_builder_save_memory(ctx.get(), builder, archive.data(), archive.size(), &size), BSVX_RESULT_OK);
 
         const fs::path out = make_temp_dir("texel_formats") / "formats.btx";
-        REQUIRE_EQ(bsvx_texture_builder_save(ctx.get(), builder, out.string().c_str(), 0), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_texture_builder_save(ctx.get(), builder, path_to_utf8_string(out).c_str(), 0), BSVX_RESULT_OK);
         bsvx_texture_builder_destroy(builder);
 
         bsvx_texture_builder* reopened = nullptr;
-        REQUIRE_EQ(bsvx_texture_builder_open(ctx.get(), out.string().c_str(), &reopened), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_texture_builder_open(ctx.get(), path_to_utf8_string(out).c_str(), &reopened), BSVX_RESULT_OK);
         REQUIRE_EQ(bsvx_texture_builder_validate(ctx.get(), reopened, nullptr, 0, &size, &issues), BSVX_RESULT_BUFFER_TOO_SMALL);
         REQUIRE_EQ(issues, 0u);
         bsvx_texture_builder_destroy(reopened);
@@ -2248,7 +2263,7 @@ namespace {
 
         size_t count = 0;
         REQUIRE_EQ(bsvx_world_fill_box(ctx.get(), world.get(), 0, 0, 0, 1, 1, 1, 2u, 1, &count), BSVX_RESULT_OK);
-        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), out_root.string().c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_ex2(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str(), BSVX_SAVE_DEFAULT, nullptr), BSVX_RESULT_OK);
 
         World reloaded = load_world(ctx, out_root);
         for (size_t i = 0; i < colors.size(); ++i) {
@@ -2270,7 +2285,7 @@ namespace {
 
         // Colours also survive a standalone region, which carries its own world desc.
         const fs::path region_path = out_root / "standalone.bvx";
-        REQUIRE_EQ(bsvx_world_save_region_ex(ctx.get(), reloaded.get(), region_path.string().c_str()), BSVX_RESULT_OK);
+        REQUIRE_EQ(bsvx_world_save_region_ex(ctx.get(), reloaded.get(), path_to_utf8_string(region_path).c_str()), BSVX_RESULT_OK);
 
         World standalone = load_region(ctx, region_path);
         uint32_t color = 0;
@@ -2430,6 +2445,12 @@ namespace {
         // The path the world reports back must be the same UTF-8 it was given.
         const std::string source = get_string([&](char* b, size_t c, size_t* n) { return bsvx_world_get_source_path(reloaded.get(), b, c, n); });
         REQUIRE(source.find(folder) != std::string::npos);
+
+        // An unnamed world takes its name from the directory it is saved into. That derivation used
+        // path::string(), which on MSVC narrows through the active code page and throws for
+        // characters it cannot represent -- so this assertion is the one that catches a regression
+        // back to a narrow conversion anywhere in the save path.
+        REQUIRE(get_string([&](char* b, size_t c, size_t* n) { return bsvx_world_get_name(reloaded.get(), b, c, n); }) == folder);
 
         REQUIRE(get_string([&](char* b, size_t c, size_t* n) { return bsvx_world_get_registry_name(reloaded.get(), 1u, b, c, n); })
             == u8_to_string(u8"pierre grisâtre"));

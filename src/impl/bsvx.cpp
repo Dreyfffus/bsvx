@@ -40,7 +40,7 @@ namespace bsvx {
         {
             std::ifstream is(path, std::ios::binary);
             if (!is) {
-                throw std::runtime_error("[bsvx]: Parser: could not open file: " + path.string());
+                throw std::runtime_error("[bsvx]: Parser: could not open file: " + path_to_utf8(path));
             }
 
             is.seekg(0, std::ios::end);
@@ -51,7 +51,7 @@ namespace bsvx {
             if (size != 0) {
                 is.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
                 if (!is) {
-                    throw std::runtime_error("[bsvx]: Parser: failed to read file: " + path.string());
+                    throw std::runtime_error("[bsvx]: Parser: failed to read file: " + path_to_utf8(path));
                 }
             }
             return bytes;
@@ -152,7 +152,7 @@ namespace bsvx {
                 return btx::Archive::load_from_memory(std::span(bytes.data(), bytes.size()));
             }
             catch (const std::exception& e) {
-                throw std::runtime_error("[bsvx]: Parser: could not load .btx '" + path.string() + "': " + e.what());
+                throw std::runtime_error("[bsvx]: Parser: could not load .btx '" + path_to_utf8(path) + "': " + e.what());
             }
         }
 
@@ -523,7 +523,7 @@ namespace bsvx {
                 ref.relative_path = require_string((*tex_tbl)["path"], "textures.path");
                 ref.absolute_path = make_absolute_from_root(manifest.root_dir, manifest.textures_dir / ref.relative_path);
                 if (ref.id.empty()) {
-                    ref.id = ref.relative_path.stem().string();
+                    ref.id = path_to_utf8(ref.relative_path.stem());
                 }
                 ref.path_hash = fnv1a64_string(ref.relative_path.generic_string());
                 ref.content_hash = optional_u64((*tex_tbl)["content_hash"], 0);
@@ -584,7 +584,7 @@ namespace bsvx {
             }
 
             if (manifest.name.empty()) {
-                manifest.name = optional_string(tbl["name"]).value_or(manifest.root_dir.filename().string());
+                manifest.name = optional_string(tbl["name"]).value_or(path_to_utf8(manifest.root_dir.filename()));
             }
             if (manifest.uuid.empty()) {
                 manifest.uuid = optional_string(tbl["uuid"]).value_or("");
@@ -855,7 +855,7 @@ namespace bsvx {
             manifest.manifest_path = manifest_path;
             if (manifest.regions_dir.empty()) manifest.regions_dir = "regions";
             if (manifest.textures_dir.empty()) manifest.textures_dir = "textures";
-            if (manifest.name.empty()) manifest.name = root_dir.filename().string();
+            if (manifest.name.empty()) manifest.name = path_to_utf8(root_dir.filename());
 
             manifest.textures.clear();
             for (size_t i = 0; i < package.textures.size(); ++i) {
@@ -864,7 +864,7 @@ namespace bsvx {
                 ref.relative_path = choose_texture_relative_path(asset, i);
                 ref.absolute_path = (root_dir / manifest.textures_dir / ref.relative_path).lexically_normal();
                 if (ref.id.empty()) {
-                    ref.id = ref.relative_path.stem().string();
+                    ref.id = path_to_utf8(ref.relative_path.stem());
                 }
                 ref.path_hash = fnv1a64_string((manifest.textures_dir / ref.relative_path).generic_string());
                 manifest.textures.push_back(std::move(ref));
@@ -954,12 +954,12 @@ namespace bsvx {
         }
 
         if (!fs.is_directory(path)) {
-            throw std::runtime_error("[bsvx]: Parser: path does not exist: " + path.string());
+            throw std::runtime_error("[bsvx]: Parser: path does not exist: " + path_to_utf8(path));
         }
 
         const auto manifest = path / "manifest.toml";
         if (!fs.is_file(manifest)) {
-            throw std::runtime_error("[bsvx]: Parser: manifest.toml not found in directory: " + path.string());
+            throw std::runtime_error("[bsvx]: Parser: manifest.toml not found in directory: " + path_to_utf8(path));
         }
         return manifest.lexically_normal();
     }
@@ -975,11 +975,11 @@ namespace bsvx {
 
         toml::table tbl;
         try {
-            tbl = toml::parse(manifest_text, absolute_manifest.string());
+            tbl = toml::parse(manifest_text, path_to_utf8(absolute_manifest));
         }
         catch (const toml::parse_error& err) {
             std::ostringstream oss;
-            oss << "[bsvx]: Parser: failed to parse manifest '" << absolute_manifest.string() << "': " << err;
+            oss << "[bsvx]: Parser: failed to parse manifest '" << path_to_utf8(absolute_manifest) << "': " << err;
             throw std::runtime_error(oss.str());
         }
 
@@ -1019,7 +1019,7 @@ namespace bsvx {
             TextureReference ref{};
             ref.relative_path = file_name;
             ref.absolute_path = (texture_root / file_name).lexically_normal();
-            ref.id = ref.relative_path.stem().string();
+            ref.id = path_to_utf8(ref.relative_path.stem());
             ref.path_hash = fnv1a64_string((manifest.textures_dir / ref.relative_path).generic_string());
             ref.content_hash = 0;
             manifest.textures.push_back(std::move(ref));
@@ -1083,7 +1083,7 @@ namespace bsvx {
             TextureReference tex_ref{};
             tex_ref.relative_path = trim_nul_padded(btx_ref.relative_path, sizeof(btx_ref.relative_path));
             tex_ref.absolute_path = make_absolute_from_root(pkg.manifest.root_dir, tex_ref.relative_path);
-            tex_ref.id = tex_ref.relative_path.stem().string();
+            tex_ref.id = path_to_utf8(tex_ref.relative_path.stem());
             tex_ref.path_hash = btx_ref.path_hash;
             tex_ref.content_hash = btx_ref.content_hash;
             pkg.manifest.textures.push_back(tex_ref);
@@ -1114,12 +1114,12 @@ namespace bsvx {
         const auto absolute_region = fs.normalize(region_path);
         auto region_archive = bvx::Archive::load_from_memory(fs.read_file(absolute_region));
         if (!region_archive.is_standalone()) {
-            throw std::runtime_error("[bsvx]: Parser: region is not standalone: " + absolute_region.string());
+            throw std::runtime_error("[bsvx]: Parser: region is not standalone: " + path_to_utf8(absolute_region));
         }
 
         return make_standalone_package(std::move(region_archive),
             absolute_region.parent_path(),
-            absolute_region.stem().string(),
+            path_to_utf8(absolute_region.stem()),
             absolute_region.filename(),
             true,
             fs);
@@ -1205,7 +1205,7 @@ namespace bsvx {
                 if (reg_archive.region_x != expected[0] ||
                     reg_archive.region_y != expected[1] ||
                     reg_archive.region_z != expected[2]) {
-                    throw std::runtime_error("[bsvx]: Parser: region coordinate mismatch for " + ref.absolute_path.string());
+                    throw std::runtime_error("[bsvx]: Parser: region coordinate mismatch for " + path_to_utf8(ref.absolute_path));
                 }
             }
 
@@ -1214,14 +1214,14 @@ namespace bsvx {
             // editor has to be able to open the world in order to repair it.
             if (pkg.manifest.world_desc.manifest_hash != 0 && reg_archive.manifest_hash != 0 &&
                 reg_archive.manifest_hash != pkg.manifest.world_desc.manifest_hash) {
-                const std::string message = "[bsvx]: Parser: manifest hash mismatch for region " + ref.absolute_path.string();
+                const std::string message = "[bsvx]: Parser: manifest hash mismatch for region " + path_to_utf8(ref.absolute_path);
                 if (!options.ignore_hash_mismatch) throw std::runtime_error(message);
                 warn(message);
             }
 
             if (pkg.manifest.world_desc.registry_hash != 0 && reg_archive.registry_hash != 0 &&
                 reg_archive.registry_hash != pkg.manifest.world_desc.registry_hash) {
-                const std::string message = "[bsvx]: Parser: registry hash mismatch for region " + ref.absolute_path.string();
+                const std::string message = "[bsvx]: Parser: registry hash mismatch for region " + path_to_utf8(ref.absolute_path);
                 if (!options.ignore_hash_mismatch) throw std::runtime_error(message);
                 warn(message);
             }
@@ -1245,7 +1245,7 @@ namespace bsvx {
 
         if (manifest.regions_dir.empty()) manifest.regions_dir = "regions";
         if (manifest.textures_dir.empty()) manifest.textures_dir = "textures";
-        if (manifest.name.empty()) manifest.name = manifest.root_dir.filename().string();
+        if (manifest.name.empty()) manifest.name = path_to_utf8(manifest.root_dir.filename());
         manifest.world_desc.registry_hash = compute_registry_hash(manifest.world_desc);
 
         const std::string toml_text = serialize_manifest_toml(manifest);
@@ -1253,11 +1253,11 @@ namespace bsvx {
 
         std::ofstream os(manifest.manifest_path, std::ios::binary);
         if (!os) {
-            throw std::runtime_error("[bsvx]: Parser: could not open manifest for writing: " + manifest.manifest_path.string());
+            throw std::runtime_error("[bsvx]: Parser: could not open manifest for writing: " + path_to_utf8(manifest.manifest_path));
         }
         os.write(toml_text.data(), static_cast<std::streamsize>(toml_text.size()));
         if (!os) {
-            throw std::runtime_error("[bsvx]: Parser: failed writing manifest: " + manifest.manifest_path.string());
+            throw std::runtime_error("[bsvx]: Parser: failed writing manifest: " + path_to_utf8(manifest.manifest_path));
         }
     }
 
