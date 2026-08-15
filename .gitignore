@@ -429,5 +429,11 @@ cmake-build-*/
 /libbsvx.so
 /bsvx_tests
 
+# Python packaging leftovers. __pycache__ and build/ are already covered above; these are not, and
+# a single `pip install ./python` drops them straight into the working tree.
+*.egg-info/
+.eggs/
+dist/
+
 .clangd
 .clang-format

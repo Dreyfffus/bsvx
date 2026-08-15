@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <span>
 #include <stdexcept>
@@ -69,6 +70,30 @@ template <TriviallySerializable T> void read_raw(std::istream &is, std::vector<T
 void append_bytes(std::vector<std::byte> &out, std::span<const std::byte> bytes);
 
 void append_bytes(std::vector<std::byte> &out, std::vector<std::byte> bytes);
+
+// Writes through a sibling temp file and renames onto the target, so a process that dies mid-write
+// leaves the previous file intact rather than a truncated one. rename() is atomic on the same
+// filesystem on both POSIX and Win32; the temp file is created next to the target for that reason.
+// backup != false keeps the previous contents as "<path>.bak".
+void write_file_atomic(const std::filesystem::path &path, std::span<const std::byte> bytes, bool backup = false);
+
+// Direct, non-atomic write. Kept for callers that have already staged a temp file of their own.
+void write_file_direct(const std::filesystem::path &path, std::span<const std::byte> bytes);
+
+// Paths crossing the C boundary are UTF-8 on every platform. MSVC's std::filesystem::path(const
+// char*) would decode them in the active code page instead, which mangles any non-ASCII path.
+std::filesystem::path path_from_utf8(std::string_view utf8);
+
+std::string path_to_utf8(const std::filesystem::path &path);
+
+std::string to_hex(std::span<const std::byte> bytes);
+
+// Returns false when the text is not valid, evenly-sized hex.
+bool from_hex(std::string_view text, std::vector<std::byte> &out);
+
+// UTF-8 text with no control characters -- what may be written into a manifest as a bare string
+// instead of being escaped into a hex blob.
+bool is_printable_utf8(std::span<const std::byte> bytes);
 
 void resize_with_zeroes(std::vector<std::byte> &out, uint64_t new_size);
 

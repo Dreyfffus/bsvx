@@ -1,9 +1,13 @@
 #pragma once
 #include <stdint.h>
-#include <map>
-#include <string>
-#include <filesystem>
 #include <array>
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
 
 #define BSVX_NODISCARD [[nodiscard]]
 #define VALIDATION_RESULT bsvx::ValidationError;
@@ -72,8 +76,13 @@ namespace bsvx {
 		DENSE_U32_VOXEL_KEY = 1
 	};
 
+	// The frame a world's integer coordinates are expressed in. X_RIGHT_Y_UP_Z_FORWARD is the
+	// canonical one -- conversions are defined as a signed axis permutation relative to it -- and is
+	// what every world written before ABI v4 carries.
 	enum class AxisConvention : uint16_t {
-		X_RIGHT_Y_UP_Z_FORWARD = 0
+		X_RIGHT_Y_UP_Z_FORWARD	= 0,	// Godot: +X right, +Y up, +Z toward the viewer. Right-handed.
+		X_RIGHT_Z_UP_Y_FORWARD	= 1,	// Blender, 3ds Max: +X right, +Z up, +Y away. Right-handed.
+		X_RIGHT_Y_UP_Z_BACK		= 2		// Unity: +X right, +Y up, +Z away. Left-handed.
 	};
 
 	enum class FaceState : uint8_t {
@@ -89,7 +98,18 @@ namespace bsvx {
 		COLLISION		= 4,
 		DISTANCE_FIELD	= 5,
 		LIGHT			= 6,
+		METADATA		= 7,
 		USER_BASE		= 0x80000000u
+	};
+
+	// Written into SectionRecord's former padding word. A pre-v4 writer left it zero, which is why
+	// FLAGS_PRESENT exists: without it there is no way to tell "not chunk-associated" from "written
+	// by a build that did not record the flag", and the reader has to fall back to guessing from the
+	// entry count.
+	enum class SectionFlags : uint32_t {
+		NONE				= 0,
+		FLAGS_PRESENT		= 1u,
+		CHUNK_ASSOCIATED	= 1u << 1
 	};
 
 	enum class VoxelCodec : uint16_t {
@@ -105,5 +125,49 @@ namespace bsvx {
 
 	struct ValidationError {
 		std::string message;
+	};
+
+	enum class Severity : uint32_t {
+		INFO	= 0,
+		WARNING	= 1,
+		ERROR	= 2
+	};
+
+	// Stable numbers: a host turns these into its own localized text and into "select the thing that
+	// is wrong" actions, so they must not be renumbered once shipped.
+	enum class ValidationCode : uint32_t {
+		NONE						= 0,
+		VOXEL_KEY_NOT_IN_REGISTRY	= 1,
+		MATERIAL_NOT_FOUND			= 2,
+		REGION_OUT_OF_BOUNDS		= 3,
+		CHUNK_OUT_OF_REGION			= 4,
+		DUPLICATE_REGION_COORD		= 5,
+		DUPLICATE_VOXEL_KEY			= 6,
+		AIR_KEY_REGISTERED			= 7,
+		TEXTURE_PATH_TOO_LONG		= 8,
+		TEXTURE_ARCHIVE_INVALID		= 9,
+		TEXTURE_REF_UNRESOLVED		= 10,
+		GEOMETRY_INVALID			= 11,
+		EMPTY_REGION				= 12,
+		REGISTRY_EMPTY				= 13,
+		NO_TEXTURES					= 14,
+		UNITS_UNSET					= 15
+	};
+
+	struct ValidationIssue final {
+		Severity severity = Severity::WARNING;
+		ValidationCode code = ValidationCode::NONE;
+		int64_t region_index = -1;   // -1 when the issue is not region-scoped
+		int64_t chunk_ordinal = -1;  // -1 when the issue is not chunk-scoped
+		uint32_t voxel_key = 0;      // 0 when irrelevant
+		std::string message;
+	};
+
+	// Return false to cancel. Long operations call this between units of work and unwind with a
+	// CancelledError, which never leaves a partially written file behind when the write is atomic.
+	using ProgressFn = std::function<bool(std::string_view stage, size_t done, size_t total)>;
+
+	struct CancelledError final : std::runtime_error {
+		CancelledError() : std::runtime_error("[bsvx]: operation cancelled by the host") {}
 	};
 }

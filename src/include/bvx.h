@@ -37,6 +37,10 @@ namespace bsvx::bvx {
 		std::vector<ChunkSummary> chunk_summaries;
 		std::vector<PayloadSection> sections;
 
+		// Round-trips through a non-chunk METADATA section. Keys this build does not understand are
+		// preserved verbatim, which is what makes a third-party rewrite of a region non-destructive.
+		MetadataMap metadata;
+
 		constexpr bool is_standalone() const noexcept { return standalone.has_value(); }
 
 		static uint64_t make_chunk_key(uint16_t x, uint16_t y, uint16_t z);
@@ -61,6 +65,21 @@ namespace bsvx::bvx {
 		std::optional<std::span<const std::byte>> get_chunk_payload(SectionType type, uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, uint16_t* out_codec = nullptr, uint16_t* out_entry_flags = nullptr) const;
 		std::vector<uint32_t> decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const GeometryDesc* geometry_override = nullptr) const;
 
+		// Content identity of a chunk: FNV-1a over the *decoded* voxels, so re-encoding the same
+		// voxels under a different codec does not change it. That is what lets a host tell which
+		// chunks a user actually edited.
+		uint64_t chunk_content_hash(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const GeometryDesc* geometry_override = nullptr) const;
+
+		// --- removal ---------------------------------------------------------------------------
+		// Drops the chunk from the map, its summary, and its entry in every chunk-associated
+		// section. Ordinals after it shift down by one; the payload bytes stay in their blobs until
+		// compact() runs. Returns false when the chunk does not exist.
+		bool remove_chunk(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z);
+		// Keeps the chunk in the map but drops every payload it owns -- an "erased but still
+		// authored" chunk, which is how an editor represents deliberately empty space.
+		bool clear_chunk(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z);
+		bool remove_chunk_payload(SectionType type, uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z);
+
 		// Every set_chunk_* appends to a section blob and repoints the entry, so repeated edits grow
 		// the archive without bound. compact() rewrites each blob to hold only live, deduplicated
 		// ranges and returns the number of bytes reclaimed. reclaimable_bytes() reports the same
@@ -68,7 +87,9 @@ namespace bsvx::bvx {
 		size_t compact();
 		size_t reclaimable_bytes() const;
 
-		bool save_to_file(const std::string& path) const;
+		// atomic writes through a temp file and renames onto the target, so an interrupted save
+		// leaves the previous region intact.
+		bool save_to_file(const std::string& path, bool atomic = true, bool backup = false) const;
 		static std::optional<Archive> load_from_file(const std::string& path);
 		static Archive load_from_memory(std::span<const std::byte> bytes);
 
@@ -142,6 +163,9 @@ namespace bsvx::bvx {
 		const std::vector<ChunkMapEntry>& chunk_map() const noexcept { return chunk_map_; }
 		const std::vector<ChunkSummary>& chunk_summaries() const noexcept { return chunk_summaries_; }
 		const std::vector<SectionRecord>& section_directory() const noexcept { return directory_; }
+		// Read at open() alongside the world desc -- it is metadata, not payload, and a host needs
+		// it to decide what to do with the region before paging any voxels in.
+		const MetadataMap& metadata() const noexcept { return metadata_; }
 
 		// Regions that are part of a manifest world carry no geometry; supply the world's before
 		// decoding anything from them.
@@ -173,6 +197,7 @@ namespace bsvx::bvx {
 		std::optional<WorldDesc> standalone_;
 		std::optional<GeometryDesc> geometry_override_;
 		std::unordered_map<uint64_t, uint32_t> chunk_index_;
+		MetadataMap metadata_;
 	};
 
 }

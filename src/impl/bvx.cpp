@@ -225,6 +225,78 @@ namespace bsvx::bvx {
 		return decode_voxel_payload(static_cast<VoxelCodec>(entry.codec), payload, g.chunk_size_x, g.chunk_size_y, g.chunk_size_z);
 
 	}
+	uint64_t Archive::chunk_content_hash(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const GeometryDesc* geometry_override) const
+	{
+		const auto dense = decode_chunk_voxels(chunk_x, chunk_y, chunk_z, geometry_override);
+		return fnv1a64(std::as_bytes(std::span(dense.data(), dense.size())));
+	}
+	bool Archive::remove_chunk(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z)
+	{
+		const auto found = try_find_chunk_index(chunk_x, chunk_y, chunk_z);
+		if (!found) return false;
+		const uint32_t index = *found;
+
+		// The summary table is addressed through ChunkMapEntry::summary_index rather than
+		// positionally, so every index above the erased one has to come down with it.
+		const uint32_t summary_index = chunk_map[index].summary_index;
+		if (summary_index < chunk_summaries.size()) {
+			chunk_summaries.erase(chunk_summaries.begin() + static_cast<ptrdiff_t>(summary_index));
+			for (ChunkMapEntry& entry : chunk_map) {
+				if (entry.summary_index > summary_index) --entry.summary_index;
+			}
+		}
+
+		chunk_map.erase(chunk_map.begin() + static_cast<ptrdiff_t>(index));
+
+		for (PayloadSection& sec : sections) {
+			if (!sec.chunk_associated) continue;
+			if (index < sec.entries.size()) sec.entries.erase(sec.entries.begin() + static_cast<ptrdiff_t>(index));
+		}
+
+		rebuild_chunk_index();
+		return true;
+	}
+	bool Archive::clear_chunk(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z)
+	{
+		const auto found = try_find_chunk_index(chunk_x, chunk_y, chunk_z);
+		if (!found) return false;
+		const uint32_t index = *found;
+
+		for (PayloadSection& sec : sections) {
+			if (!sec.chunk_associated || index >= sec.entries.size()) continue;
+			sec.entries[index] = OffsetSizeEntry{};
+		}
+
+		chunk_summaries[chunk_map[index].summary_index] = ChunkSummary{};
+		chunk_map[index].flags = to_underlying(bit_or(ChunkFlags::PRESENT, ChunkFlags::CHUNK_EMPTY));
+		return true;
+	}
+	bool Archive::remove_chunk_payload(SectionType type, uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z)
+	{
+		const auto found = try_find_chunk_index(chunk_x, chunk_y, chunk_z);
+		if (!found) return false;
+		const uint32_t index = *found;
+
+		for (PayloadSection& sec : sections) {
+			if (sec.type != type || !sec.chunk_associated || index >= sec.entries.size()) continue;
+			if (sec.entries[index].offset == INVALID_OFFSET) return false;
+
+			sec.entries[index] = OffsetSizeEntry{};
+
+			auto& cmap = chunk_map[index];
+			switch (type) {
+			case SectionType::VOXELS:			cmap.flags &= ~to_underlying(ChunkFlags::HAS_VOXELS); break;
+			case SectionType::SURFACE:			cmap.flags &= ~to_underlying(ChunkFlags::HAS_SURFACE_BAKE); break;
+			case SectionType::COLLISION:		cmap.flags &= ~to_underlying(ChunkFlags::HAS_COLLISION_BAKE); break;
+			case SectionType::DISTANCE_FIELD:	cmap.flags &= ~to_underlying(ChunkFlags::HAS_DISTANCE_FIELD); break;
+			case SectionType::LIGHT:			cmap.flags &= ~to_underlying(ChunkFlags::HAS_LIGHT_BAKE); break;
+			default: break;
+			}
+			if (type == SectionType::VOXELS) chunk_summaries[cmap.summary_index] = ChunkSummary{};
+			return true;
+		}
+		return false;
+	}
 	size_t Archive::reclaimable_bytes() const
 	{
 		size_t reclaimable = 0;
@@ -285,6 +357,16 @@ namespace bsvx::bvx {
 			world_sec.entries[0] = { .offset = 0, .size = static_cast<uint32_t>(world_sec.blob.size()), .flags = 0, .codec = 0 };
 			temp_sections.push_back(std::move(world_sec));
 		}
+		if (!metadata.empty()) {
+			PayloadSection meta_sec{};
+			meta_sec.type = SectionType::METADATA;
+			meta_sec.chunk_associated = false;
+			meta_sec.default_codec = 0;
+			meta_sec.blob = build_metadata_blob(metadata);
+			meta_sec.entries.resize(1);
+			meta_sec.entries[0] = { .offset = 0, .size = static_cast<uint32_t>(meta_sec.blob.size()), .flags = 0, .codec = 0 };
+			temp_sections.push_back(std::move(meta_sec));
+		}
 
 		std::sort(temp_sections.begin(), temp_sections.end(), [](const PayloadSection& a, const PayloadSection& b) {
 			return static_cast<uint32_t>(a.type) < static_cast<uint32_t>(b.type);
@@ -320,6 +402,8 @@ namespace bsvx::bvx {
 			dir[i].default_codec = temp_sections[i].default_codec;
 			dir[i].entry_stride = sizeof(OffsetSizeEntry);
 			dir[i].entry_count = static_cast<uint32_t>(temp_sections[i].entries.size());
+			dir[i].section_flags = to_underlying(SectionFlags::FLAGS_PRESENT);
+			if (temp_sections[i].chunk_associated) dir[i].section_flags |= to_underlying(SectionFlags::CHUNK_ASSOCIATED);
 
 			cursor = align64(cursor, 16);
 			dir[i].entry_table_offset = cursor;
@@ -368,12 +452,20 @@ namespace bsvx::bvx {
 		os.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
 		if (!os) throw std::runtime_error("[bvx]: write failed");
 	}
-	bool Archive::save_to_file(const std::string& path) const
+	bool Archive::save_to_file(const std::string& path, bool atomic, bool backup) const
 	{
-		std::ofstream os(path, std::ios::binary);
-		if (!os) return false;
-		serialize(os);
-		return static_cast<bool>(os);
+		// Paths crossing this API are UTF-8, so they must not be reinterpreted in the platform's
+		// narrow encoding on the way to std::filesystem.
+		const std::filesystem::path target = path_from_utf8(path);
+		const std::vector<std::byte> bytes = serialize_to_bytes();
+		try {
+			if (atomic) write_file_atomic(target, std::span<const std::byte>(bytes.data(), bytes.size()), backup);
+			else write_file_direct(target, std::span<const std::byte>(bytes.data(), bytes.size()));
+			return true;
+		}
+		catch (const std::exception&) {
+			return false;
+		}
 	}
 	Archive Archive::deserialize(std::span<const std::byte> bytes)
 	{
@@ -442,11 +534,20 @@ namespace bsvx::bvx {
 				out.standalone = parse_world_desc_blob(blob);
 				continue;
 			}
+			if (type == SectionType::METADATA) {
+				if (entries.size() != 1 || entries[0].offset != 0 || entries[0].size != blob.size()) throw std::runtime_error("[bvx]: malformed metadata section");
+				out.metadata = parse_metadata_blob(blob);
+				continue;
+			}
 
 			PayloadSection sec{};
 			sec.type = type;
 			sec.default_codec = rec.default_codec;
-			sec.chunk_associated = (entries.size() == out.chunk_map.size());
+			// Pre-v4 writers left section_flags zeroed, so the entry-count heuristic is still the
+			// fallback -- but only when the writer genuinely did not record the answer.
+			sec.chunk_associated = has_bits(static_cast<SectionFlags>(rec.section_flags), SectionFlags::FLAGS_PRESENT)
+				? has_bits(static_cast<SectionFlags>(rec.section_flags), SectionFlags::CHUNK_ASSOCIATED)
+				: (entries.size() == out.chunk_map.size());
 			sec.entries = std::move(entries);
 			sec.blob = std::move(blob);
 			out.sections.push_back(std::move(sec));
@@ -472,7 +573,7 @@ namespace bsvx::bvx {
 	}
 	std::optional<Archive> Archive::load_from_file(const std::string& path)
 	{
-		std::ifstream is(path, std::ios::binary);
+		std::ifstream is(path_from_utf8(path), std::ios::binary);
 		if (!is) return std::nullopt;
 		return std::optional<Archive>{deserialize(is)};
 	}
@@ -535,6 +636,7 @@ namespace bsvx::bvx {
 	FileByteSource::FileByteSource(const std::string& path)
 		: impl_(std::make_unique<Impl>())
 	{
+		// POSIX takes the UTF-8 bytes verbatim; no conversion needed or wanted here.
 		impl_->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
 		if (impl_->fd < 0) throw std::runtime_error("[bvx]: could not open region file: " + path);
 
@@ -563,7 +665,7 @@ namespace bsvx::bvx {
 	struct FileByteSource::Impl {
 		std::mutex mutex;
 		std::ifstream stream;
-		explicit Impl(const std::string& path) : stream(path, std::ios::binary) {}
+		explicit Impl(const std::string& path) : stream(path_from_utf8(path), std::ios::binary) {}
 	};
 
 	FileByteSource::FileByteSource(const std::string& path)
@@ -638,13 +740,18 @@ namespace bsvx::bvx {
 
 			out.entries_[i] = read_table<OffsetSizeEntry>(src, rec.entry_table_offset, rec.entry_count, "section entry table");
 
-			// The world desc is metadata, not a payload -- it carries the geometry needed to decode
-			// anything else, so it is the one blob read up front.
-			if (static_cast<SectionType>(rec.section_type) == SectionType::WORLD_DESC) {
-				if (out.entries_[i].size() != 1 || out.entries_[i][0].offset != 0 || out.entries_[i][0].size != rec.blob_size) throw std::runtime_error("[bvx]: malformed world desc section");
+			// The world desc and the metadata are description, not payload -- the first carries the
+			// geometry needed to decode anything else, the second is what a host inspects before
+			// deciding whether to page the region in at all. Both are read up front; the voxel
+			// blobs are not.
+			const SectionType type = static_cast<SectionType>(rec.section_type);
+			if (type == SectionType::WORLD_DESC || type == SectionType::METADATA) {
+				if (out.entries_[i].size() != 1 || out.entries_[i][0].offset != 0 || out.entries_[i][0].size != rec.blob_size) throw std::runtime_error("[bvx]: malformed description section");
 				std::vector<std::byte> blob(static_cast<size_t>(rec.blob_size));
 				if (!blob.empty()) src.read(rec.blob_offset, std::span<std::byte>(blob.data(), blob.size()));
-				out.standalone_ = parse_world_desc_blob(blob);
+
+				if (type == SectionType::WORLD_DESC) out.standalone_ = parse_world_desc_blob(blob);
+				else out.metadata_ = parse_metadata_blob(blob);
 			}
 		}
 
@@ -750,6 +857,7 @@ namespace bsvx::bvx {
 			total += standalone_->texture_refs.size() * sizeof(BtxRef);
 			total += standalone_->registry_entries.size() * sizeof(RegistryEntry);
 		}
+		for (const auto& [key, value] : metadata_) total += key.size() + value.size();
 		return total;
 	}
 }

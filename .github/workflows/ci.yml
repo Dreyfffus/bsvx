@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            artifact: linux_x86_64
+            # A host that dlopen()s this into an existing process (Blender, a DCC tool) may already
+            # have an older libstdc++ mapped in; linking ours statically stops the two fighting.
+            cmake_args: -DBSVX_STATIC_CXX_RUNTIME=ON
+          - name: macos-universal
+            os: macos-latest
+            artifact: macos_universal
+            # Quoted: the semicolon would otherwise be a shell command separator, not a CMake
+            # list separator, and bash would try to run "arm64".
+            cmake_args: '-DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"'
+          - name: windows-x86_64
+            os: windows-latest
+            artifact: windows_x86_64
+            cmake_args: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test (C API)
+        run: ctest --test-dir build --build-config Release --output-on-failure
+
+      - name: Test (Python binding)
+        # The build stages the shared library into python/bsvx/bin/<platform>/, so the package
+        # imports straight out of the checkout.
+        run: python -m unittest discover -s python/tests -v
+        env:
+          PYTHONPATH: python
+
+      - name: Stage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bsvx-${{ matrix.artifact }}
+          path: |
+            python/bsvx/bin/**/*.so
+            python/bsvx/bin/**/*.dylib
+            python/bsvx/bin/**/*.dll
+          if-no-files-found: error
+
+  strict:
+    name: linux-strict (C++20, checked STL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The library claims to build as C++20 as well as C++23, and the checked STL is what catches
+      # the iterator and bounds mistakes an ordinary build lets through.
+      - name: Build and test with C++20
+        run: |
+          cmake -S . -B build20 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=20 -DBSVX_STAGE_PYTHON=OFF
+          cmake --build build20
+          ctest --test-dir build20 --output-on-failure
+
+      - name: Build and test with _GLIBCXX_DEBUG
+        run: |
+          cmake -S . -B builddbg -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-D_GLIBCXX_DEBUG -D_GLIBCXX_ASSERTIONS" -DBSVX_STAGE_PYTHON=OFF
+          cmake --build builddbg
+          ctest --test-dir builddbg --output-on-failure

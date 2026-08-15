@@ -16,17 +16,20 @@ namespace bsvx::bvx {
 					bool on = false;
 					switch (face_axis) {
 					case 0: on = (face_side > 0) ? (x == sx - 1) : (x == 0); break;
-					case 1: on = (face_side > 0) ? (x == sx - 1) : (x == 0); break;
-					case 2: on = (face_side > 0) ? (x == sx - 1) : (x == 0); break;
+					case 1: on = (face_side > 0) ? (y == sy - 1) : (y == 0); break;
+					case 2: on = (face_side > 0) ? (z == sz - 1) : (z == 0); break;
 					default: throw std::runtime_error("[bvx]: Invalid face_axis convention"); break;
 					}
 					if (!on) continue;
+
+					++total;
 					if (dense[linear_index(x, y, z, sx, sy, sz)] != 0) ++occupied;
 				}
 			}
 		}
 
-		if (!occupied) return FaceState::EMPTY;
+		if (total == 0u) return FaceState::EMPTY;
+		if (occupied == 0u) return FaceState::EMPTY;
 		if (occupied == total) return FaceState::FULL;
 		return FaceState::MIXED;
 	}
@@ -125,6 +128,7 @@ namespace bsvx::bvx {
 
 	std::vector<std::byte> build_world_desc_blob(const WorldDesc& out) {
 		DiskWorldDescHeader hdr{};
+		hdr.version = WORLD_DESC_VERSION;
 		hdr.chunk_size_x = out.geometry.chunk_size_x;
 		hdr.chunk_size_y = out.geometry.chunk_size_y;
 		hdr.chunk_size_z = out.geometry.chunk_size_z;
@@ -150,6 +154,53 @@ namespace bsvx::bvx {
 		append_pod(blob, hdr);
 		append_raw(blob, std::span(out.texture_refs.data(), out.texture_refs.size()));
 		append_raw(blob, std::span(out.registry_entries.data(), out.registry_entries.size()));
+
+		// --- v2 extension ------------------------------------------------------------------------
+		// Offset 0 of the string table is always an empty string, so a name_offset of 0 means "no
+		// name" without needing a sentinel.
+		std::vector<std::byte> strings;
+		strings.push_back(std::byte{ 0 });
+
+		std::vector<uint32_t> name_offsets;
+		name_offsets.reserve(out.registry_entries.size());
+		for (const RegistryEntry& entry : out.registry_entries) {
+			const std::string name = out.registry_name(entry.voxel_key);
+			if (name.empty()) {
+				name_offsets.push_back(0u);
+				continue;
+			}
+			name_offsets.push_back(static_cast<uint32_t>(strings.size()));
+			const auto bytes = std::as_bytes(std::span(name.data(), name.size()));
+			strings.insert(strings.end(), bytes.begin(), bytes.end());
+			strings.push_back(std::byte{ 0 });
+		}
+
+		std::vector<uint32_t> colors;
+		colors.reserve(out.registry_entries.size());
+		bool any_color = false;
+		for (const RegistryEntry& entry : out.registry_entries) {
+			const uint32_t color = out.registry_color(entry.voxel_key);
+			colors.push_back(color);
+			any_color = any_color || color != 0u;
+		}
+		if (!any_color) colors.clear();
+
+		DiskWorldDescExt ext{};
+		ext.ext_size = static_cast<uint32_t>(sizeof(DiskWorldDescExt));
+		ext.registry_name_count = static_cast<uint32_t>(name_offsets.size());
+		ext.registry_color_count = static_cast<uint32_t>(colors.size());
+		ext.voxel_size_x = out.units.voxel_size_x;
+		ext.voxel_size_y = out.units.voxel_size_y;
+		ext.voxel_size_z = out.units.voxel_size_z;
+		ext.origin_x = out.units.origin_x;
+		ext.origin_y = out.units.origin_y;
+		ext.origin_z = out.units.origin_z;
+		ext.string_table_size = static_cast<uint32_t>(strings.size());
+
+		append_pod(blob, ext);
+		append_raw(blob, std::span<const uint32_t>(name_offsets.data(), name_offsets.size()));
+		append_raw(blob, std::span<const uint32_t>(colors.data(), colors.size()));
+		append_bytes(blob, std::span<const std::byte>(strings.data(), strings.size()));
 		return blob;
 	}
 
@@ -195,6 +246,109 @@ namespace bsvx::bvx {
 			cursor += reg_bytes;
 		}
 
+		// A v1 blob simply ends here. Anything newer than v2 is read for the fields v2 knows and the
+		// rest is skipped via ext_size, so a forward-written file still loads.
+		if (hdr.version < 2u || cursor + sizeof(DiskWorldDescExt) > blob.size()) return out;
+
+		// Read ext_size first, then copy only as much as both sides agree exists: a blob written by
+		// an older v2 build has a shorter extension, and reading sizeof() bytes would spill into the
+		// tables behind it.
+		uint32_t ext_size = 0;
+		std::memcpy(&ext_size, blob.data() + cursor, sizeof(ext_size));
+		if (ext_size < sizeof(uint32_t) * 2u) throw std::runtime_error("[bvx]: world desc extension truncated");
+		if (cursor + ext_size > blob.size()) throw std::runtime_error("[bvx]: world desc extension out of bounds");
+
+		DiskWorldDescExt ext{};
+		std::memcpy(&ext, blob.data() + cursor, std::min<size_t>(ext_size, sizeof(ext)));
+		cursor += ext_size;
+
+		out.units.voxel_size_x = ext.voxel_size_x;
+		out.units.voxel_size_y = ext.voxel_size_y;
+		out.units.voxel_size_z = ext.voxel_size_z;
+		out.units.origin_x = ext.origin_x;
+		out.units.origin_y = ext.origin_y;
+		out.units.origin_z = ext.origin_z;
+
+		const size_t offsets_bytes = static_cast<size_t>(ext.registry_name_count) * sizeof(uint32_t);
+		const size_t colors_bytes = static_cast<size_t>(ext.registry_color_count) * sizeof(uint32_t);
+		if (cursor + offsets_bytes + colors_bytes + ext.string_table_size > blob.size()) throw std::runtime_error("[bvx]: world desc name table out of bounds");
+
+		std::vector<uint32_t> name_offsets(ext.registry_name_count);
+		if (!name_offsets.empty()) {
+			std::memcpy(name_offsets.data(), blob.data() + cursor, offsets_bytes);
+		}
+		cursor += offsets_bytes;
+
+		std::vector<uint32_t> colors(ext.registry_color_count);
+		if (!colors.empty()) {
+			std::memcpy(colors.data(), blob.data() + cursor, colors_bytes);
+		}
+		cursor += colors_bytes;
+
+		for (size_t i = 0; i < colors.size() && i < out.registry_entries.size(); ++i) {
+			if (colors[i] != 0u) out.registry_colors.emplace(out.registry_entries[i].voxel_key, colors[i]);
+		}
+
+		const char* strings = reinterpret_cast<const char*>(blob.data() + cursor);
+		const size_t strings_size = ext.string_table_size;
+
+		for (size_t i = 0; i < name_offsets.size() && i < out.registry_entries.size(); ++i) {
+			const uint32_t offset = name_offsets[i];
+			if (offset == 0u || offset >= strings_size) continue;
+
+			size_t len = 0;
+			while (offset + len < strings_size && strings[offset + len] != '\0') ++len;
+			if (len != 0) out.registry_names.emplace(out.registry_entries[i].voxel_key, std::string(strings + offset, len));
+		}
+
+		return out;
+	}
+
+	std::vector<std::byte> build_metadata_blob(const MetadataMap& metadata)
+	{
+		std::vector<std::byte> blob;
+		if (metadata.empty()) return blob;
+
+		append_pod(blob, static_cast<uint32_t>(metadata.size()));
+		for (const auto& [key, value] : metadata) {
+			append_pod(blob, static_cast<uint32_t>(key.size()));
+			append_pod(blob, static_cast<uint32_t>(value.size()));
+		}
+		for (const auto& [key, value] : metadata) {
+			const auto key_bytes = std::as_bytes(std::span(key.data(), key.size()));
+			blob.insert(blob.end(), key_bytes.begin(), key_bytes.end());
+			blob.insert(blob.end(), value.begin(), value.end());
+		}
+		return blob;
+	}
+
+	MetadataMap parse_metadata_blob(std::span<const std::byte> blob)
+	{
+		MetadataMap out;
+		if (blob.empty()) return out;
+
+		size_t cursor = 0;
+		const uint32_t count = read_pod<uint32_t>(blob, cursor);
+
+		std::vector<std::pair<uint32_t, uint32_t>> sizes;
+		sizes.reserve(count);
+		for (uint32_t i = 0; i < count; ++i) {
+			const uint32_t key_size = read_pod<uint32_t>(blob, cursor);
+			const uint32_t value_size = read_pod<uint32_t>(blob, cursor);
+			sizes.emplace_back(key_size, value_size);
+		}
+
+		for (const auto& [key_size, value_size] : sizes) {
+			if (cursor + key_size + value_size > blob.size()) throw std::runtime_error("[bvx]: metadata blob truncated");
+
+			std::string key(reinterpret_cast<const char*>(blob.data() + cursor), key_size);
+			cursor += key_size;
+
+			std::vector<std::byte> value(blob.begin() + static_cast<ptrdiff_t>(cursor), blob.begin() + static_cast<ptrdiff_t>(cursor + value_size));
+			cursor += value_size;
+
+			out.emplace(std::move(key), std::move(value));
+		}
 		return out;
 	}
 

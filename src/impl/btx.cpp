@@ -5,18 +5,81 @@
 namespace bsvx::btx {
 
 uint32_t bytes_per_texel(uint32_t vk_format) {
-
-  constexpr uint32_t VK_FORMAT_R8G8B8A8_UNORM_LOCAL = 37;
-  constexpr uint32_t VK_FORMAT_R8G8B8A8_SRGB_LOCAL = 43;
-
   switch (vk_format) {
-  case VK_FORMAT_R8G8B8A8_UNORM_LOCAL:
+  case VK_FORMAT_R8_UNORM_:
+    return 1;
+  case VK_FORMAT_R8G8_UNORM_:
+  case VK_FORMAT_R16_SFLOAT_:
+    return 2;
+  case VK_FORMAT_R8G8B8A8_UNORM_:
+  case VK_FORMAT_R8G8B8A8_SRGB_:
+  case VK_FORMAT_B8G8R8A8_UNORM_:
+  case VK_FORMAT_B8G8R8A8_SRGB_:
+  case VK_FORMAT_R32_SFLOAT_:
     return 4;
-  case VK_FORMAT_R8G8B8A8_SRGB_LOCAL:
-    return 4;
+  case VK_FORMAT_R16G16B16A16_SFLOAT_:
+    return 8;
+  case VK_FORMAT_R32G32B32A32_SFLOAT_:
+    return 16;
   default:
+    // Block-compressed formats land here too: they have no meaningful per-texel size.
     return 0;
   }
+}
+
+bool is_block_compressed(uint32_t vk_format) {
+  switch (vk_format) {
+  case VK_FORMAT_BC1_RGB_UNORM_BLOCK_:
+  case VK_FORMAT_BC1_RGB_SRGB_BLOCK_:
+  case VK_FORMAT_BC1_RGBA_UNORM_BLOCK_:
+  case VK_FORMAT_BC1_RGBA_SRGB_BLOCK_:
+  case VK_FORMAT_BC3_UNORM_BLOCK_:
+  case VK_FORMAT_BC3_SRGB_BLOCK_:
+  case VK_FORMAT_BC4_UNORM_BLOCK_:
+  case VK_FORMAT_BC5_UNORM_BLOCK_:
+  case VK_FORMAT_BC7_UNORM_BLOCK_:
+  case VK_FORMAT_BC7_SRGB_BLOCK_:
+    return true;
+  default:
+    return false;
+  }
+}
+
+uint32_t format_block_extent(uint32_t vk_format) { return is_block_compressed(vk_format) ? 4u : 1u; }
+
+uint32_t format_block_size(uint32_t vk_format) {
+  switch (vk_format) {
+  // 64 bits per 4x4 block.
+  case VK_FORMAT_BC1_RGB_UNORM_BLOCK_:
+  case VK_FORMAT_BC1_RGB_SRGB_BLOCK_:
+  case VK_FORMAT_BC1_RGBA_UNORM_BLOCK_:
+  case VK_FORMAT_BC1_RGBA_SRGB_BLOCK_:
+  case VK_FORMAT_BC4_UNORM_BLOCK_:
+    return 8;
+  // 128 bits per 4x4 block.
+  case VK_FORMAT_BC3_UNORM_BLOCK_:
+  case VK_FORMAT_BC3_SRGB_BLOCK_:
+  case VK_FORMAT_BC5_UNORM_BLOCK_:
+  case VK_FORMAT_BC7_UNORM_BLOCK_:
+  case VK_FORMAT_BC7_SRGB_BLOCK_:
+    return 16;
+  default:
+    return bytes_per_texel(vk_format);
+  }
+}
+
+bool format_is_supported(uint32_t vk_format) { return bytes_per_texel(vk_format) != 0u || is_block_compressed(vk_format); }
+
+uint64_t subresource_size(uint32_t vk_format, uint32_t width, uint32_t height) {
+  const uint32_t block = format_block_extent(vk_format);
+  const uint32_t block_size = format_block_size(vk_format);
+  if (block_size == 0u)
+    return 0u;
+
+  // A 5x5 BC7 image is 2x2 blocks, not 1.25x1.25 -- round up, never down.
+  const uint64_t blocks_x = (static_cast<uint64_t>(width) + block - 1u) / block;
+  const uint64_t blocks_y = (static_cast<uint64_t>(height) + block - 1u) / block;
+  return blocks_x * blocks_y * block_size;
 }
 
 std::pair<uint16_t, uint16_t> mip_extent_2d(uint16_t base_w, uint16_t base_h, uint16_t mip) {
@@ -55,17 +118,26 @@ BSVX_NODISCARD uint32_t Archive::append_subresource(uint32_t texture_id, uint16_
   if (layer >= tex.array_layers)
     throw std::runtime_error("[btx]: layer out of range");
 
-  const uint32_t bbp = bytes_per_texel(tex.vk_format);
-  if (bbp == 0)
-    throw std::runtime_error("[btx]: unsupported format in first version");
+  if (!format_is_supported(tex.vk_format))
+    throw std::runtime_error("[btx]: unsupported vk_format");
 
-  const uint64_t row_width = packed_row_length != 0 ? packed_row_length : width;
-  const uint64_t image_height = packed_image_height != 0 ? packed_image_height : height;
-  const uint64_t expected = row_width * image_height * bbp;
+  uint64_t expected = 0;
+  if (is_block_compressed(tex.vk_format)) {
+    // bufferRowLength / bufferImageHeight are texel counts even for block formats, so they still
+    // describe the padded extent -- the size just comes out of the block arithmetic.
+    const uint32_t row_width = packed_row_length != 0 ? packed_row_length : width;
+    const uint32_t image_height = packed_image_height != 0 ? packed_image_height : height;
+    expected = subresource_size(tex.vk_format, row_width, image_height);
+  } else {
+    const uint64_t bbp = bytes_per_texel(tex.vk_format);
+    const uint64_t row_width = packed_row_length != 0 ? packed_row_length : width;
+    const uint64_t image_height = packed_image_height != 0 ? packed_image_height : height;
+    expected = row_width * image_height * bbp;
+  }
 
   if (texels.size() != expected) {
-    throw std::runtime_error("[btx]: texel payload size does not match format / extents");
-    ;
+    throw std::runtime_error("[btx]: texel payload size does not match format / extents (expected " + std::to_string(expected) + " bytes, got " +
+                             std::to_string(texels.size()) + ")");
   }
 
   const uint64_t blob_offset = static_cast<uint64_t>(blob.size());
@@ -108,7 +180,7 @@ std::vector<ValidationError> Archive::validate() const {
       errors.push_back({"2D texture has 0 array layers"});
     if (tex.kind == TextureKind::TEXTURE_3D && tex.array_layers != 1)
       errors.push_back({"3D textures must have 1 array layer in this format"});
-    if (bytes_per_texel(tex.vk_format) == 0 && tex.kind != TextureKind::TEXEL_BUFFER)
+    if (!format_is_supported(tex.vk_format) && tex.kind != TextureKind::TEXEL_BUFFER)
       errors.push_back({"unsupported vk_format in current implementation"});
   }
 
@@ -146,6 +218,15 @@ std::vector<ValidationError> Archive::validate() const {
 }
 
 void Archive::serialize(std::ostream &os) const {
+  const std::vector<std::byte> bytes = serialize_to_bytes();
+  if (!bytes.empty()) {
+    os.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!os)
+      throw std::runtime_error("[btx]: failed writing archive");
+  }
+}
+
+std::vector<std::byte> Archive::serialize_to_bytes() const {
   const auto errs = validate();
   if (!errs.empty())
     throw std::runtime_error("[btx]: serialize called on invalid archive");
@@ -230,29 +311,27 @@ void Archive::serialize(std::ostream &os) const {
   header.blob_offset = cursor;
   header.blob_size = blob.size();
   header.crc64 = fnv1a64(std::span(blob.data(), blob.size()));
+  cursor += blob.size();
 
-  // Write header first.
-  write_pod(os, header);
+  // Built as one zero-filled image rather than written through a seeking stream: the alignment
+  // padding then has a defined value, and the same code path can serve an in-memory save.
+  std::vector<std::byte> bytes(static_cast<size_t>(cursor), std::byte{0});
+  std::memcpy(bytes.data(), &header, sizeof(header));
 
-  // Pad / seek each table exactly to its recorded offset.
-  seek_abs(os, header.sampler_table_offset);
-  write_raw(os, samplers);
+  const auto put_table = [&](uint64_t offset, const auto &table) {
+    if (!table.empty())
+      std::memcpy(bytes.data() + offset, table.data(), table.size() * sizeof(typename std::decay_t<decltype(table)>::value_type));
+  };
 
-  seek_abs(os, header.texture_table_offset);
-  write_raw(os, disk_textures);
+  put_table(header.sampler_table_offset, samplers);
+  put_table(header.texture_table_offset, disk_textures);
+  put_table(header.subresource_table_offset, ordered_subresources);
+  put_table(header.material_table_offset, materials);
 
-  seek_abs(os, header.subresource_table_offset);
-  write_raw(os, ordered_subresources);
+  if (!blob.empty())
+    std::memcpy(bytes.data() + header.blob_offset, blob.data(), blob.size());
 
-  seek_abs(os, header.material_table_offset);
-  write_raw(os, materials);
-
-  seek_abs(os, header.blob_offset);
-  if (!blob.empty()) {
-    os.write(reinterpret_cast<const char *>(blob.data()), static_cast<std::streamsize>(blob.size()));
-    if (!os)
-      throw std::runtime_error("[btx]: failed writing blob");
-  }
+  return bytes;
 }
 
 Archive Archive::deserialize(std::istream &is) {
@@ -320,16 +399,94 @@ Archive Archive::deserialize(std::istream &is) {
   return out;
 }
 
-bool Archive::save_to_file(const std::string &path) const {
-  std::ofstream os(path, std::ios::binary);
-  if (!os)
+bool Archive::save_to_file(const std::string &path, bool atomic, bool backup) const {
+  // Paths crossing this API are UTF-8; std::filesystem must not decode them in the active code page.
+  const std::filesystem::path target = path_from_utf8(path);
+  const std::vector<std::byte> bytes = serialize_to_bytes();
+  try {
+    if (atomic)
+      write_file_atomic(target, std::span<const std::byte>(bytes.data(), bytes.size()), backup);
+    else
+      write_file_direct(target, std::span<const std::byte>(bytes.data(), bytes.size()));
+    return true;
+  } catch (const std::exception &) {
     return false;
-  serialize(os);
-  return static_cast<bool>(os);
+  }
+}
+
+void Archive::generate_mips(uint32_t texture_id) {
+  if (texture_id >= textures.size())
+    throw std::runtime_error("[btx]: invalid texture_id");
+
+  const TextureDesc tex = textures[texture_id];
+  if (tex.kind != TextureKind::TEXTURE_2D)
+    throw std::runtime_error("[btx]: generate_mips only supports 2D textures");
+  // Validate before the "nothing to do" shortcut: asking to generate mips for a format that can
+  // never have them is a mistake worth reporting whatever mip_levels happens to be.
+  //
+  // Downsampling a BCn image means decoding, filtering and re-encoding it -- a compressor, which
+  // this library is not. Compressed mips have to be supplied by whatever produced the blocks.
+  const uint32_t bpp = bytes_per_texel(tex.vk_format);
+  if (bpp == 0)
+    throw std::runtime_error(is_block_compressed(tex.vk_format) ? "[btx]: cannot generate mips for a block-compressed format; supply them yourself"
+                                                                : "[btx]: unsupported format for mip generation");
+  // The box filter below averages bytes, which is only meaningful for 8-bit channels.
+  if (tex.vk_format == VK_FORMAT_R16_SFLOAT_ || tex.vk_format == VK_FORMAT_R16G16B16A16_SFLOAT_ || tex.vk_format == VK_FORMAT_R32_SFLOAT_ ||
+      tex.vk_format == VK_FORMAT_R32G32B32A32_SFLOAT_)
+    throw std::runtime_error("[btx]: mip generation only supports 8-bit-per-channel formats");
+
+  if (tex.mip_levels <= 1)
+    return;
+
+  // Anything above level 0 is regenerated, so drop what is there rather than ending up with two
+  // subresources claiming the same (texture, mip, layer).
+  std::erase_if(subresources, [&](const SubresourceDesc &sub) { return sub.texture_id == texture_id && sub.mip_level > 0; });
+
+  for (uint16_t layer = 0; layer < tex.array_layers; ++layer) {
+    const auto base = std::find_if(subresources.begin(), subresources.end(), [&](const SubresourceDesc &sub) {
+      return sub.texture_id == texture_id && sub.mip_level == 0 && sub.layer_or_slice == layer;
+    });
+    if (base == subresources.end())
+      continue;
+
+    auto [prev_w, prev_h] = mip_extent_2d(tex.width, tex.height, 0);
+    std::vector<std::byte> prev(blob.begin() + static_cast<ptrdiff_t>(base->blob_offset),
+                                blob.begin() + static_cast<ptrdiff_t>(base->blob_offset + base->blob_size));
+
+    for (uint16_t mip = 1; mip < tex.mip_levels; ++mip) {
+      auto [w, h] = mip_extent_2d(tex.width, tex.height, mip);
+      std::vector<std::byte> next(static_cast<size_t>(w) * h * bpp);
+
+      // 2x2 box filter, clamped at the edges so odd extents keep their last row/column.
+      for (uint16_t y = 0; y < h; ++y) {
+        for (uint16_t x = 0; x < w; ++x) {
+          const uint32_t x0 = std::min<uint32_t>(static_cast<uint32_t>(x) * 2u, prev_w - 1u);
+          const uint32_t y0 = std::min<uint32_t>(static_cast<uint32_t>(y) * 2u, prev_h - 1u);
+          const uint32_t x1 = std::min<uint32_t>(x0 + 1u, prev_w - 1u);
+          const uint32_t y1 = std::min<uint32_t>(y0 + 1u, prev_h - 1u);
+
+          for (uint32_t c = 0; c < bpp; ++c) {
+            const auto at = [&](uint32_t px, uint32_t py) {
+              return static_cast<uint32_t>(prev[(static_cast<size_t>(py) * prev_w + px) * bpp + c]);
+            };
+            const uint32_t sum = at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1);
+            next[(static_cast<size_t>(y) * w + x) * bpp + c] = static_cast<std::byte>((sum + 2u) / 4u);
+          }
+        }
+      }
+
+      const uint32_t index = append_subresource(texture_id, mip, layer, w, h, std::span<const std::byte>(next.data(), next.size()), 0, 0);
+      (void)index;
+
+      prev = std::move(next);
+      prev_w = w;
+      prev_h = h;
+    }
+  }
 }
 
 std::optional<Archive> Archive::load_from_file(const std::string &path) {
-  std::ifstream is(path, std::ios::binary);
+  std::ifstream is(path_from_utf8(path), std::ios::binary);
   if (!is)
     return std::nullopt;
   return deserialize(is);

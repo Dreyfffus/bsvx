@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bsvx"
+version = "4.0.0"
+description = "Python binding for BSVX (Basil Voxel) — voxel world asset loader, authoring and rewriting"
+readme = "README.md"
+requires-python = ">=3.9"
+# Named rather than referenced: setuptools refuses a license file outside the project directory,
+# and the repository's LICENSE sits one level up.
+license = "Unlicense"
+dependencies = []
+
+[project.urls]
+Source = "https://github.com/Dreyfffus/bsvx"
+
+[tool.setuptools]
+packages = ["bsvx"]
+
+[tool.setuptools.package-data]
+# The shared library, staged here by the CMake build (BSVX_STAGE_PYTHON).
+bsvx = ["bin/*/*.so", "bin/*/*.dylib", "bin/*/*.dll"]

@@ -97,6 +97,54 @@ namespace bsvx {
             }
         };
 
+        class NativeFileWriter final : public FileWriter {
+        public:
+            void write_file(const std::filesystem::path& path, std::span<const std::byte> bytes, bool atomic, bool backup) override
+            {
+                if (atomic) write_file_atomic(path, bytes, backup);
+                else write_file_direct(path, bytes);
+            }
+
+            void make_directories(const std::filesystem::path& dir) override
+            {
+                if (!dir.empty()) std::filesystem::create_directories(dir);
+            }
+
+            bool exists(const std::filesystem::path& path) const override
+            {
+                std::error_code ec;
+                return std::filesystem::exists(path, ec);
+            }
+
+            void remove_file(const std::filesystem::path& path) override
+            {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+
+            std::vector<std::filesystem::path> list_files(const std::filesystem::path& dir, std::string_view extension) const override
+            {
+                std::vector<std::filesystem::path> out;
+                std::error_code ec;
+                if (!std::filesystem::is_directory(dir, ec)) return out;
+
+                for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                    if (ec) break;
+                    if (!entry.is_regular_file()) continue;
+                    if (entry.path().extension() != extension) continue;
+                    out.push_back(entry.path().filename());
+                }
+                return out;
+            }
+
+            std::vector<std::byte> read_file(const std::filesystem::path& path) const override
+            {
+                std::error_code ec;
+                if (!std::filesystem::is_regular_file(path, ec)) return {};
+                return read_file_bytes(path);
+            }
+        };
+
         static btx::Archive load_btx(const FileSystem& fs, const std::filesystem::path& path)
         {
             try {
@@ -240,12 +288,11 @@ namespace bsvx {
             manifest.world_desc.geometry.region_size_z = region_size[2];
 
             if (auto axis = optional_string(geometry["axis_convention"])) {
-                if (*axis == "x_right_y_up_z_forward") {
-                    manifest.world_desc.axis_convention = AxisConvention::X_RIGHT_Y_UP_Z_FORWARD;
-                }
-                else {
+                const auto parsed = axis_convention_from_name(*axis);
+                if (!parsed) {
                     throw std::runtime_error("[bsvx]::Parser: unsupported geometry.axis_convention: " + *axis);
                 }
+                manifest.world_desc.axis_convention = *parsed;
             }
 
             if (auto schema = optional_string(geometry["voxel_schema"])) {
@@ -317,6 +364,78 @@ namespace bsvx {
             manifest.world_desc.manifest_hash = manifest_bytes_hash;
         }
 
+        static std::optional<double> optional_double(const toml::node_view<const toml::node>& view)
+        {
+            if (auto value = view.value<double>()) return *value;
+            if (auto value = view.value<int64_t>()) return static_cast<double>(*value);
+            return std::nullopt;
+        }
+
+        // voxel_size accepts a scalar (uniform) or a 3-array (non-uniform); origin is always a
+        // 3-array of world-space units.
+        static void parse_units(Manifest& manifest, const toml::table& tbl)
+        {
+            auto units = tbl["units"];
+            if (!units) return;
+
+            const auto element = [](const toml::array& arr, size_t index, double fallback) {
+                const auto* node = arr.get(index);
+                if (!node) return fallback;
+                if (auto value = node->value<double>()) return *value;
+                if (auto value = node->value<int64_t>()) return static_cast<double>(*value);
+                return fallback;
+                };
+
+            if (auto scalar = optional_double(units["voxel_size"])) {
+                manifest.world_desc.units.voxel_size_x = *scalar;
+                manifest.world_desc.units.voxel_size_y = *scalar;
+                manifest.world_desc.units.voxel_size_z = *scalar;
+            }
+            else if (auto* arr = units["voxel_size"].as_array()) {
+                if (arr->size() != 3) throw std::runtime_error("[bsvx]: Parser: units.voxel_size must be a number or an array[3]");
+                manifest.world_desc.units.voxel_size_x = element(*arr, 0, 1.0);
+                manifest.world_desc.units.voxel_size_y = element(*arr, 1, 1.0);
+                manifest.world_desc.units.voxel_size_z = element(*arr, 2, 1.0);
+            }
+
+            if (auto* arr = units["origin"].as_array()) {
+                if (arr->size() != 3) throw std::runtime_error("[bsvx]: Parser: units.origin must be an array[3]");
+                manifest.world_desc.units.origin_x = element(*arr, 0, 0.0);
+                manifest.world_desc.units.origin_y = element(*arr, 1, 0.0);
+                manifest.world_desc.units.origin_z = element(*arr, 2, 0.0);
+            }
+        }
+
+        // Values are opaque bytes. Printable UTF-8 is written as a plain string so a human can read
+        // and edit it; anything else round-trips through { hex = "..." } without loss.
+        static void parse_metadata(Manifest& manifest, const toml::table& tbl)
+        {
+            manifest.metadata.clear();
+
+            auto* meta = tbl["metadata"].as_table();
+            if (!meta) return;
+
+            for (const auto& [key, node] : *meta) {
+                std::vector<std::byte> value;
+
+                if (auto text = optional_string(toml::node_view<const toml::node>(node))) {
+                    const auto bytes = std::as_bytes(std::span(text->data(), text->size()));
+                    value.assign(bytes.begin(), bytes.end());
+                }
+                else if (auto* inner = node.as_table()) {
+                    const auto hex = optional_string((*inner)["hex"]);
+                    if (!hex || !from_hex(*hex, value)) {
+                        throw std::runtime_error("[bsvx]: Parser: metadata." + std::string(key.str()) + " must be a string or { hex = \"...\" }");
+                    }
+                }
+                else {
+                    throw std::runtime_error("[bsvx]: Parser: metadata." + std::string(key.str()) + " must be a string or { hex = \"...\" }");
+                }
+
+                manifest.metadata.emplace(std::string(key.str()), std::move(value));
+            }
+        }
+
         static void parse_registry(Manifest& manifest, const toml::table& tbl)
         {
             auto registry = tbl["registry"];
@@ -346,9 +465,19 @@ namespace bsvx {
                 entry.flags = parse_registry_flags((*entry_tbl)["flags"]);
                 if (auto name = optional_string((*entry_tbl)["name"])) {
                     entry.name_hash = fnv1a64_string(*name);
+                    // Kept, not merely hashed. FNV-1a is not invertible, so hashing and discarding
+                    // destroyed every voxel type's name on the first save.
+                    if (!name->empty()) manifest.world_desc.registry_names[entry.voxel_key] = *name;
                 }
                 else {
                     entry.name_hash = optional_u64((*entry_tbl)["name_hash"], 0);
+                }
+
+                // A display colour that does not depend on a .btx existing yet -- authoring tools
+                // are colour-first, and a world can be built long before it has textures.
+                if ((*entry_tbl)["color"]) {
+                    const uint32_t color = static_cast<uint32_t>(optional_u64((*entry_tbl)["color"], 0));
+                    if (color != 0u) manifest.world_desc.registry_colors[entry.voxel_key] = color;
                 }
 
                 manifest.world_desc.registry_entries.push_back(entry);
@@ -502,10 +631,7 @@ namespace bsvx {
 
         static std::string to_string(AxisConvention axis)
         {
-            switch (axis) {
-            case AxisConvention::X_RIGHT_Y_UP_Z_FORWARD: return "x_right_y_up_z_forward";
-            default: throw std::runtime_error("[bsvx]: Parser: unsupported AxisConvention");
-            }
+            return std::string(axis_convention_name(axis));
         }
 
         static std::string to_string(VoxelSchema schema)
@@ -620,6 +746,35 @@ namespace bsvx {
             hashes.insert("registry", u64_hex(compute_registry_hash(manifest.world_desc)));
             tbl.insert("hashes", hashes);
 
+            if (!manifest.world_desc.units.is_default()) {
+                toml::table units{};
+                const auto& u = manifest.world_desc.units;
+                if (u.voxel_size_x == u.voxel_size_y && u.voxel_size_y == u.voxel_size_z) {
+                    units.insert("voxel_size", u.voxel_size_x);
+                }
+                else {
+                    units.insert("voxel_size", toml::array{ u.voxel_size_x, u.voxel_size_y, u.voxel_size_z });
+                }
+                units.insert("origin", toml::array{ u.origin_x, u.origin_y, u.origin_z });
+                tbl.insert("units", std::move(units));
+            }
+
+            if (!manifest.metadata.empty()) {
+                toml::table metadata{};
+                for (const auto& [key, value] : manifest.metadata) {
+                    const std::span<const std::byte> bytes(value.data(), value.size());
+                    if (is_printable_utf8(bytes)) {
+                        metadata.insert(key, std::string(reinterpret_cast<const char*>(value.data()), value.size()));
+                    }
+                    else {
+                        toml::table wrapper{};
+                        wrapper.insert("hex", to_hex(bytes));
+                        metadata.insert(key, std::move(wrapper));
+                    }
+                }
+                tbl.insert("metadata", std::move(metadata));
+            }
+
             if (!manifest.world_desc.registry_entries.empty()) {
                 toml::array reg{};
                 for (const bvx::RegistryEntry& entry : manifest.world_desc.registry_entries) {
@@ -627,7 +782,15 @@ namespace bsvx {
                     e.insert("voxel_key", static_cast<int64_t>(entry.voxel_key));
                     e.insert("material_id", static_cast<int64_t>(entry.material_id));
                     e.insert("flags", registry_flags_to_array(entry.flags));
+
+                    const std::string name = manifest.world_desc.registry_name(entry.voxel_key);
+                    if (!name.empty()) e.insert("name", name);
                     e.insert("name_hash", u64_hex(entry.name_hash));
+
+                    if (const uint32_t color = manifest.world_desc.registry_color(entry.voxel_key); color != 0u) {
+                        e.insert("color", u64_hex(color));
+                    }
+
                     reg.push_back(std::move(e));
                 }
                 tbl.insert("registry", std::move(reg));
@@ -680,6 +843,80 @@ namespace bsvx {
             }
         }
 
+        // Everything save_world does to a package before a single byte is written: fills in default
+        // directories, assigns the relative path each asset will live at, and rebuilds the texture
+        // refs and registry hash. Factored out so save_manifest_to_string produces exactly the text
+        // save_world would -- the manifest hash is taken over those bytes, so "exactly" matters.
+        static Manifest normalize_for_save(const WorldPackage& package, const std::filesystem::path& root_dir, const std::filesystem::path& manifest_path)
+        {
+            Manifest manifest = package.manifest;
+            manifest.synthetic_from_standalone_region = false;
+            manifest.root_dir = root_dir;
+            manifest.manifest_path = manifest_path;
+            if (manifest.regions_dir.empty()) manifest.regions_dir = "regions";
+            if (manifest.textures_dir.empty()) manifest.textures_dir = "textures";
+            if (manifest.name.empty()) manifest.name = root_dir.filename().string();
+
+            manifest.textures.clear();
+            for (size_t i = 0; i < package.textures.size(); ++i) {
+                const TextureAsset& asset = package.textures[i];
+                TextureReference ref = asset.ref;
+                ref.relative_path = choose_texture_relative_path(asset, i);
+                ref.absolute_path = (root_dir / manifest.textures_dir / ref.relative_path).lexically_normal();
+                if (ref.id.empty()) {
+                    ref.id = ref.relative_path.stem().string();
+                }
+                ref.path_hash = fnv1a64_string((manifest.textures_dir / ref.relative_path).generic_string());
+                manifest.textures.push_back(std::move(ref));
+            }
+
+            manifest.regions.clear();
+            for (size_t i = 0; i < package.regions.size(); ++i) {
+                const RegionAsset& asset = package.regions[i];
+                RegionReference ref = asset.ref;
+                ref.relative_path = choose_region_relative_path(asset, i);
+                ref.absolute_path = (root_dir / manifest.regions_dir / ref.relative_path).lexically_normal();
+                if (!ref.coord) {
+                    ref.coord = std::array<int32_t, 3>{ asset.archive.region_x, asset.archive.region_y, asset.archive.region_z };
+                }
+                manifest.regions.push_back(std::move(ref));
+            }
+
+            manifest.world_desc.texture_refs.clear();
+            manifest.world_desc.texture_refs.reserve(manifest.textures.size());
+            for (const TextureReference& ref : manifest.textures) {
+                const std::string path_str = (manifest.textures_dir / ref.relative_path).generic_string();
+                // A BtxRef holds 127 characters. Truncating produced a reference that silently
+                // never resolved, so refuse instead -- the caller can shorten the path or the id.
+                if (path_str.size() > bvx::BTX_REF_PATH_CAPACITY) {
+                    throw std::runtime_error("[bsvx]: Parser: texture path exceeds " + std::to_string(bvx::BTX_REF_PATH_CAPACITY) + " characters: " + path_str);
+                }
+                manifest.world_desc.texture_refs.push_back(make_btx_ref(path_str, ref.content_hash));
+            }
+            manifest.world_desc.registry_hash = compute_registry_hash(manifest.world_desc);
+            return manifest;
+        }
+
+        // Files of the given extension sitting in a managed directory that the manifest no longer
+        // references. Without this, a removed region is re-discovered on the next load and the
+        // deletion undoes itself.
+        static size_t prune_orphans(const Manifest& manifest, FileWriter& writer, const std::filesystem::path& dir, std::string_view extension, bool dry_run)
+        {
+            std::unordered_set<std::string> keep;
+            for (const RegionReference& ref : manifest.regions) keep.insert(ref.absolute_path.generic_string());
+            for (const TextureReference& ref : manifest.textures) keep.insert(ref.absolute_path.generic_string());
+
+            size_t removed = 0;
+            for (const auto& name : writer.list_files(dir, extension)) {
+                const auto full = (dir / name).lexically_normal();
+                if (keep.contains(full.generic_string())) continue;
+
+                ++removed;
+                if (!dry_run) writer.remove_file(full);
+            }
+            return removed;
+        }
+
         static std::pair<std::filesystem::path, std::filesystem::path>
             resolve_root_and_manifest_path(const std::filesystem::path& root_or_manifest_path)
         {
@@ -697,6 +934,13 @@ namespace bsvx {
     const FileSystem& native_filesystem()
     {
         static const NativeFileSystem instance{};
+        return instance;
+    }
+
+    FileWriter& native_filewriter()
+    {
+        // Stateless, so one shared instance is safe for concurrent saves to different worlds.
+        static NativeFileWriter instance{};
         return instance;
     }
 
@@ -749,6 +993,8 @@ namespace bsvx {
         parse_bounds(manifest, tbl);
         parse_paths(manifest, tbl);
         parse_hashes(manifest, tbl, fnv1a64_bytes(std::span(manifest_bytes.data(), manifest_bytes.size())));
+        parse_units(manifest, tbl);
+        parse_metadata(manifest, tbl);
         parse_registry(manifest, tbl);
         parse_textures(manifest, tbl);
         parse_regions(manifest, tbl);
@@ -918,23 +1164,40 @@ namespace bsvx {
         return pkg;
     }
 
-    WorldPackage Parser::load_world(const std::filesystem::path& manifest_or_root, const FileSystem& fs)
+    WorldPackage Parser::load_world(const std::filesystem::path& manifest_or_root, const FileSystem& fs, const LoadOptions& options)
     {
         if (manifest_or_root.extension() == ".bvx" && fs.is_file(manifest_or_root)) {
             return load_region(manifest_or_root, fs);
         }
 
+        const auto warn = [&](std::string message) {
+            if (options.warnings) options.warnings->push_back(std::move(message));
+            };
+        const auto tick = [&](std::string_view stage, size_t done, size_t total) {
+            if (options.progress && !options.progress(stage, done, total)) throw CancelledError{};
+            };
+
         WorldPackage pkg{};
         pkg.manifest = parse_manifest(manifest_or_root, fs);
 
-        for (const TextureReference& ref : pkg.manifest.textures) {
-            TextureAsset asset{};
-            asset.ref = ref;
-            asset.archive = load_btx(fs, ref.absolute_path);
-            pkg.textures.push_back(std::move(asset));
+        if (!options.skip_textures) {
+            for (size_t i = 0; i < pkg.manifest.textures.size(); ++i) {
+                tick("textures", i, pkg.manifest.textures.size());
+
+                const TextureReference& ref = pkg.manifest.textures[i];
+                TextureAsset asset{};
+                asset.ref = ref;
+                asset.archive = load_btx(fs, ref.absolute_path);
+                pkg.textures.push_back(std::move(asset));
+            }
         }
 
-        for (const RegionReference& ref : pkg.manifest.regions) {
+        if (options.skip_regions) return pkg;
+
+        for (size_t i = 0; i < pkg.manifest.regions.size(); ++i) {
+            tick("regions", i, pkg.manifest.regions.size());
+
+            const RegionReference& ref = pkg.manifest.regions[i];
             bvx::Archive reg_archive = bvx::Archive::load_from_memory(fs.read_file(ref.absolute_path));
 
             if (ref.coord) {
@@ -946,14 +1209,21 @@ namespace bsvx {
                 }
             }
 
+            // The manifest hash is FNV over the manifest's raw bytes, so a trailing newline or a
+            // CRLF checkout invalidates every region in the world. A runtime is right to refuse; an
+            // editor has to be able to open the world in order to repair it.
             if (pkg.manifest.world_desc.manifest_hash != 0 && reg_archive.manifest_hash != 0 &&
                 reg_archive.manifest_hash != pkg.manifest.world_desc.manifest_hash) {
-                throw std::runtime_error("[bsvx]: Parser: manifest hash mismatch for region " + ref.absolute_path.string());
+                const std::string message = "[bsvx]: Parser: manifest hash mismatch for region " + ref.absolute_path.string();
+                if (!options.ignore_hash_mismatch) throw std::runtime_error(message);
+                warn(message);
             }
 
             if (pkg.manifest.world_desc.registry_hash != 0 && reg_archive.registry_hash != 0 &&
                 reg_archive.registry_hash != pkg.manifest.world_desc.registry_hash) {
-                throw std::runtime_error("[bsvx]: Parser: registry hash mismatch for region " + ref.absolute_path.string());
+                const std::string message = "[bsvx]: Parser: registry hash mismatch for region " + ref.absolute_path.string();
+                if (!options.ignore_hash_mismatch) throw std::runtime_error(message);
+                warn(message);
             }
 
             RegionAsset asset{};
@@ -991,98 +1261,115 @@ namespace bsvx {
         }
     }
 
-    void Parser::save_world(const WorldPackage& package, const std::filesystem::path& root_or_manifest_path)
+    std::string Parser::save_manifest_to_string(const WorldPackage& package, const std::filesystem::path& root_or_manifest_path)
     {
         auto [root_dir_raw, manifest_path_raw] = resolve_root_and_manifest_path(root_or_manifest_path);
         const auto root_dir = std::filesystem::absolute(root_dir_raw).lexically_normal();
         const auto manifest_path = std::filesystem::absolute(manifest_path_raw).lexically_normal();
+        return serialize_manifest_toml(normalize_for_save(package, root_dir, manifest_path));
+    }
 
-        std::filesystem::create_directories(root_dir);
+    SaveReport Parser::save_world(const WorldPackage& package, const std::filesystem::path& root_or_manifest_path, const SaveOptions& options)
+    {
+        auto [root_dir_raw, manifest_path_raw] = resolve_root_and_manifest_path(root_or_manifest_path);
 
-        Manifest manifest = package.manifest;
-        manifest.synthetic_from_standalone_region = false;
-        manifest.root_dir = root_dir;
-        manifest.manifest_path = manifest_path;
-        if (manifest.regions_dir.empty()) manifest.regions_dir = "regions";
-        if (manifest.textures_dir.empty()) manifest.textures_dir = "textures";
-        if (manifest.name.empty()) manifest.name = root_dir.filename().string();
+        // Only a native path can be made absolute. A host VFS has its own root, so absolute() would
+        // prepend this process's working directory to it and write the world somewhere nobody asked.
+        const bool native = options.writer == nullptr;
+        const auto root_dir = native ? std::filesystem::absolute(root_dir_raw).lexically_normal() : root_dir_raw.lexically_normal();
+        const auto manifest_path = native ? std::filesystem::absolute(manifest_path_raw).lexically_normal() : manifest_path_raw.lexically_normal();
 
-        manifest.textures.clear();
-        for (size_t i = 0; i < package.textures.size(); ++i) {
-            const TextureAsset& asset = package.textures[i];
-            TextureReference ref = asset.ref;
-            ref.relative_path = choose_texture_relative_path(asset, i);
-            ref.absolute_path = (root_dir / manifest.textures_dir / ref.relative_path).lexically_normal();
-            if (ref.id.empty()) {
-                ref.id = ref.relative_path.stem().string();
-            }
-            ref.path_hash = fnv1a64_string((manifest.textures_dir / ref.relative_path).generic_string());
-            manifest.textures.push_back(std::move(ref));
-        }
-
-        manifest.regions.clear();
-        for (size_t i = 0; i < package.regions.size(); ++i) {
-            const RegionAsset& asset = package.regions[i];
-            RegionReference ref = asset.ref;
-            ref.relative_path = choose_region_relative_path(asset, i);
-            ref.absolute_path = (root_dir / manifest.regions_dir / ref.relative_path).lexically_normal();
-            if (!ref.coord) {
-                ref.coord = std::array<int32_t, 3>{ asset.archive.region_x, asset.archive.region_y, asset.archive.region_z };
-            }
-            manifest.regions.push_back(std::move(ref));
-        }
-
-        manifest.world_desc.texture_refs.clear();
-        manifest.world_desc.texture_refs.reserve(manifest.textures.size());
-        for (const TextureReference& ref : manifest.textures) {
-            const std::string path_str = (manifest.textures_dir / ref.relative_path).generic_string();
-            manifest.world_desc.texture_refs.push_back(make_btx_ref(path_str, ref.content_hash));
-        }
-        manifest.world_desc.registry_hash = compute_registry_hash(manifest.world_desc);
+        Manifest manifest = normalize_for_save(package, root_dir, manifest_path);
 
         const std::string toml_text = serialize_manifest_toml(manifest);
         const uint64_t manifest_hash = fnv1a64_bytes(std::as_bytes(std::span(toml_text.data(), toml_text.size())));
         manifest.world_desc.manifest_hash = manifest_hash;
 
-        ensure_parent_dir(manifest_path);
-        std::ofstream mos(manifest_path, std::ios::binary);
-        if (!mos) {
-            throw std::runtime_error("[bsvx]: Parser: could not open manifest for writing: " + manifest_path.string());
+        SaveReport report{};
+        FileWriter& writer = options.writer ? *options.writer : native_filewriter();
+
+        const auto tick = [&](std::string_view stage, size_t done, size_t total) {
+            if (options.progress && !options.progress(stage, done, total)) throw CancelledError{};
+            };
+
+        // A region stores the manifest hash it was baked against, so the moment the manifest text
+        // changes every region has to be restamped -- an incremental save is only possible while the
+        // manifest is byte-identical to what is already on disk.
+        bool write_manifest = true;
+        if (options.dirty_only) {
+            const auto existing = writer.read_file(manifest_path);
+            if (!existing.empty()) {
+                const std::string_view existing_text(reinterpret_cast<const char*>(existing.data()), existing.size());
+                write_manifest = (existing_text != toml_text);
+            }
         }
-        mos.write(toml_text.data(), static_cast<std::streamsize>(toml_text.size()));
-        if (!mos) {
-            throw std::runtime_error("[bsvx]: Parser: failed writing manifest: " + manifest_path.string());
-        }
+        const bool full_rewrite = !options.dirty_only || write_manifest;
+        report.full_rewrite = options.dirty_only && full_rewrite;
 
         const auto texture_root = (root_dir / manifest.textures_dir).lexically_normal();
         const auto region_root = (root_dir / manifest.regions_dir).lexically_normal();
-        std::filesystem::create_directories(texture_root);
-        std::filesystem::create_directories(region_root);
+
+        if (!options.dry_run) {
+            writer.make_directories(root_dir);
+            writer.make_directories(texture_root);
+            writer.make_directories(region_root);
+        }
+
+        const auto write_bytes = [&](const std::filesystem::path& path, std::span<const std::byte> bytes) {
+            report.files_written += 1u;
+            report.bytes_written += bytes.size();
+            if (options.dry_run) return;
+
+            writer.make_directories(path.parent_path());
+            writer.write_file(path, bytes, options.atomic, options.backup);
+            };
+
+        tick("manifest", 0, 1);
+        if (write_manifest) {
+            write_bytes(manifest_path, std::as_bytes(std::span(toml_text.data(), toml_text.size())));
+            report.manifest_written = true;
+        }
+        else {
+            report.files_skipped += 1u;
+        }
 
         if (package.textures.size() != manifest.textures.size()) {
             throw std::runtime_error("[bsvx]: Parser: internal texture reference mismatch during save");
         }
         for (size_t i = 0; i < package.textures.size(); ++i) {
+            tick("textures", i, package.textures.size());
+
             const auto& asset = package.textures[i];
             const auto& ref = manifest.textures[i];
-            ensure_parent_dir(ref.absolute_path);
-            if (!asset.archive.save_to_file(ref.absolute_path.string())) {
-                throw std::runtime_error("[bsvx]: Parser: failed writing .btx: " + ref.absolute_path.string());
+            // A .btx carries no manifest hash, so an unchanged one never has to be rewritten --
+            // even when the manifest itself did change.
+            if (options.dirty_only && !asset.dirty && writer.exists(ref.absolute_path)) {
+                report.files_skipped += 1u;
+                continue;
             }
+            const std::vector<std::byte> bytes = asset.archive.serialize_to_bytes();
+            write_bytes(ref.absolute_path, std::span<const std::byte>(bytes.data(), bytes.size()));
         }
 
         if (package.regions.size() != manifest.regions.size()) {
             throw std::runtime_error("[bsvx]: Parser: internal region reference mismatch during save");
         }
         for (size_t i = 0; i < package.regions.size(); ++i) {
+            tick("regions", i, package.regions.size());
+
             const auto& asset = package.regions[i];
             const auto& ref = manifest.regions[i];
-            bvx::Archive archive = asset.archive;
-            archive.manifest_hash = manifest_hash;
-            archive.registry_hash = manifest.world_desc.registry_hash;
             if (!ref.coord) {
                 throw std::runtime_error("[bsvx]: Parser: region coord missing during save");
             }
+            if (!full_rewrite && !asset.dirty && writer.exists(ref.absolute_path)) {
+                report.files_skipped += 1u;
+                continue;
+            }
+
+            bvx::Archive archive = asset.archive;
+            archive.manifest_hash = manifest_hash;
+            archive.registry_hash = manifest.world_desc.registry_hash;
             archive.region_x = (*ref.coord)[0];
             archive.region_y = (*ref.coord)[1];
             archive.region_z = (*ref.coord)[2];
@@ -1090,11 +1377,17 @@ namespace bsvx {
                 archive.standalone->manifest_hash = manifest_hash;
                 archive.standalone->registry_hash = manifest.world_desc.registry_hash;
             }
-            ensure_parent_dir(ref.absolute_path);
-            if (!archive.save_to_file(ref.absolute_path.string())) {
-                throw std::runtime_error("[bsvx]: Parser: failed writing .bvx: " + ref.absolute_path.string());
-            }
+            const std::vector<std::byte> bytes = archive.serialize_to_bytes();
+            write_bytes(ref.absolute_path, std::span<const std::byte>(bytes.data(), bytes.size()));
         }
+
+        if (options.prune_orphans) {
+            tick("prune", 0, 1);
+            report.files_removed += prune_orphans(manifest, writer, region_root, ".bvx", options.dry_run);
+            report.files_removed += prune_orphans(manifest, writer, texture_root, ".btx", options.dry_run);
+        }
+
+        return report;
     }
 
     bvx::Archive Parser::build_standalone_region(const WorldPackage& package, std::vector<std::filesystem::path>* out_texture_file_names)
@@ -1131,33 +1424,406 @@ namespace bsvx {
         return build_standalone_region(package, nullptr).serialize_to_bytes();
     }
 
-    void Parser::save_region(const WorldPackage& package, const std::filesystem::path& region_path_in)
+    VoxelAddress locate_voxel(const bvx::GeometryDesc& geometry, int64_t x, int64_t y, int64_t z)
+    {
+        if (geometry.chunk_size_x == 0 || geometry.chunk_size_y == 0 || geometry.chunk_size_z == 0 ||
+            geometry.region_size_x == 0 || geometry.region_size_y == 0 || geometry.region_size_z == 0) {
+            throw std::invalid_argument("[bsvx]: locate_voxel: geometry dimensions must all be non-zero");
+        }
+
+        // Flooring division, not C's truncation: voxel -1 belongs to region -1, not region 0.
+        const auto floor_div = [](int64_t value, int64_t divisor) {
+            const int64_t quotient = value / divisor;
+            return (value % divisor != 0 && ((value < 0) != (divisor < 0))) ? quotient - 1 : quotient;
+            };
+        const auto floor_mod = [&](int64_t value, int64_t divisor) {
+            return value - floor_div(value, divisor) * divisor;
+            };
+
+        const int64_t chunk_size[3] = { geometry.chunk_size_x, geometry.chunk_size_y, geometry.chunk_size_z };
+        const int64_t region_span[3] = {
+            chunk_size[0] * geometry.region_size_x,
+            chunk_size[1] * geometry.region_size_y,
+            chunk_size[2] * geometry.region_size_z,
+        };
+        const int64_t world[3] = { x, y, z };
+
+        VoxelAddress out{};
+        for (int axis = 0; axis < 3; ++axis) {
+            const int64_t region = floor_div(world[axis], region_span[axis]);
+            if (region < INT32_MIN || region > INT32_MAX) throw std::out_of_range("[bsvx]: locate_voxel: region coordinate out of range");
+
+            const int64_t within_region = floor_mod(world[axis], region_span[axis]);
+            out.region[axis] = static_cast<int32_t>(region);
+            out.chunk[axis] = static_cast<uint16_t>(within_region / chunk_size[axis]);
+            out.local[axis] = static_cast<uint16_t>(within_region % chunk_size[axis]);
+        }
+
+        out.local_index = static_cast<uint32_t>(out.local[0] +
+            static_cast<uint32_t>(geometry.chunk_size_x) * (out.local[1] + static_cast<uint32_t>(geometry.chunk_size_y) * out.local[2]));
+        return out;
+    }
+
+    namespace {
+        // For each convention: canonical[i] = sign[i] * native[axis[i]]. The canonical frame is
+        // X_RIGHT_Y_UP_Z_FORWARD, so its own entry is the identity.
+        struct AxisMapping final {
+            std::array<uint8_t, 3> axis{ 0, 1, 2 };
+            std::array<int8_t, 3> sign{ 1, 1, 1 };
+        };
+
+        AxisMapping mapping_for(AxisConvention convention)
+        {
+            switch (convention) {
+            case AxisConvention::X_RIGHT_Y_UP_Z_FORWARD:
+                return AxisMapping{ { 0, 1, 2 }, { 1, 1, 1 } };
+            case AxisConvention::X_RIGHT_Z_UP_Y_FORWARD:
+                // Blender (x, y, z) -> canonical (x, z, -y).
+                return AxisMapping{ { 0, 2, 1 }, { 1, 1, -1 } };
+            case AxisConvention::X_RIGHT_Y_UP_Z_BACK:
+                // Unity (x, y, z) -> canonical (x, y, -z).
+                return AxisMapping{ { 0, 1, 2 }, { 1, 1, -1 } };
+            default:
+                throw std::invalid_argument("[bsvx]: unsupported axis convention");
+            }
+        }
+    }
+
+    std::array<double, 3> convert_position(AxisConvention from, AxisConvention to, double x, double y, double z)
+    {
+        const AxisMapping in = mapping_for(from);
+        const AxisMapping out = mapping_for(to);
+        const double native[3] = { x, y, z };
+
+        double canonical[3]{};
+        for (int i = 0; i < 3; ++i) canonical[i] = in.sign[i] * native[in.axis[i]];
+
+        std::array<double, 3> result{};
+        for (int i = 0; i < 3; ++i) result[out.axis[i]] = out.sign[i] * canonical[i];
+        return result;
+    }
+
+    std::array<int64_t, 3> convert_cell(AxisConvention from, AxisConvention to, int64_t x, int64_t y, int64_t z)
+    {
+        const AxisMapping in = mapping_for(from);
+        const AxisMapping out = mapping_for(to);
+        const int64_t native[3] = { x, y, z };
+
+        // Mirroring a cell index is -c-1: cell c covers [c, c+1), whose mirror is [-c-1, -c).
+        int64_t canonical[3]{};
+        for (int i = 0; i < 3; ++i) {
+            const int64_t value = native[in.axis[i]];
+            canonical[i] = in.sign[i] > 0 ? value : -value - 1;
+        }
+
+        std::array<int64_t, 3> result{};
+        for (int i = 0; i < 3; ++i) {
+            result[out.axis[i]] = out.sign[i] > 0 ? canonical[i] : -canonical[i] - 1;
+        }
+        return result;
+    }
+
+    std::string_view axis_convention_name(AxisConvention convention)
+    {
+        switch (convention) {
+        case AxisConvention::X_RIGHT_Y_UP_Z_FORWARD: return "x_right_y_up_z_forward";
+        case AxisConvention::X_RIGHT_Z_UP_Y_FORWARD: return "x_right_z_up_y_forward";
+        case AxisConvention::X_RIGHT_Y_UP_Z_BACK:    return "x_right_y_up_z_back";
+        default: throw std::runtime_error("[bsvx]: unsupported AxisConvention");
+        }
+    }
+
+    std::optional<AxisConvention> axis_convention_from_name(std::string_view name)
+    {
+        if (name == "x_right_y_up_z_forward") return AxisConvention::X_RIGHT_Y_UP_Z_FORWARD;
+        if (name == "x_right_z_up_y_forward" || name == "blender" || name == "z_up") return AxisConvention::X_RIGHT_Z_UP_Y_FORWARD;
+        if (name == "x_right_y_up_z_back" || name == "unity") return AxisConvention::X_RIGHT_Y_UP_Z_BACK;
+        return std::nullopt;
+    }
+
+    size_t convert_world_axis_convention(WorldPackage& package, AxisConvention target, const ProgressFn& progress)
+    {
+        const AxisConvention source = package.manifest.world_desc.axis_convention;
+        if (source == target) return 0u;
+
+        const bvx::GeometryDesc geometry = package.manifest.world_desc.geometry;
+        const bvx::RegistryLookup registry = bvx::build_registry_lookup(package.manifest.world_desc);
+
+        // A flipped axis moves voxels across region and chunk boundaries, so the decomposition has
+        // to be rebuilt rather than relabelled. Gather everything, then re-scatter.
+        struct ChunkKey final {
+            std::array<int32_t, 3> region{};
+            std::array<uint16_t, 3> chunk{};
+            bool operator<(const ChunkKey& other) const noexcept
+            {
+                if (region != other.region) return region < other.region;
+                return chunk < other.chunk;
+            }
+        };
+
+        std::map<ChunkKey, std::vector<uint32_t>> rebuilt;
+        const size_t per_chunk = bvx::Archive::chunk_voxel_count(geometry);
+        size_t moved = 0;
+
+        for (size_t r = 0; r < package.regions.size(); ++r) {
+            if (progress && !progress("convert", r, package.regions.size())) throw CancelledError{};
+
+            const bvx::Archive& archive = package.regions[r].archive;
+            for (const bvx::ChunkMapEntry& chunk : archive.chunk_map) {
+                const auto dense = archive.decode_chunk_voxels(chunk.local_chunk_x, chunk.local_chunk_y, chunk.local_chunk_z, &geometry);
+
+                for (uint16_t z = 0; z < geometry.chunk_size_z; ++z) {
+                    for (uint16_t y = 0; y < geometry.chunk_size_y; ++y) {
+                        for (uint16_t x = 0; x < geometry.chunk_size_x; ++x) {
+                            const size_t index = x + static_cast<size_t>(geometry.chunk_size_x) * (y + static_cast<size_t>(geometry.chunk_size_y) * z);
+                            const uint32_t key = dense[index];
+                            if (key == 0u) continue;
+
+                            const int64_t world_x = static_cast<int64_t>(archive.region_x) * geometry.chunk_size_x * geometry.region_size_x
+                                + static_cast<int64_t>(chunk.local_chunk_x) * geometry.chunk_size_x + x;
+                            const int64_t world_y = static_cast<int64_t>(archive.region_y) * geometry.chunk_size_y * geometry.region_size_y
+                                + static_cast<int64_t>(chunk.local_chunk_y) * geometry.chunk_size_y + y;
+                            const int64_t world_z = static_cast<int64_t>(archive.region_z) * geometry.chunk_size_z * geometry.region_size_z
+                                + static_cast<int64_t>(chunk.local_chunk_z) * geometry.chunk_size_z + z;
+
+                            const auto converted = convert_cell(source, target, world_x, world_y, world_z);
+                            const VoxelAddress address = locate_voxel(geometry, converted[0], converted[1], converted[2]);
+
+                            ChunkKey target_key{};
+                            target_key.region = address.region;
+                            target_key.chunk = address.chunk;
+
+                            auto& buffer = rebuilt[target_key];
+                            if (buffer.empty()) buffer.assign(per_chunk, 0u);
+                            buffer[address.local_index] = key;
+                            ++moved;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Payload sections describe the old frame; there is no way to reinterpret a surface bake or
+        // a distance field under a permuted axis, so they go rather than silently lying.
+        package.regions.clear();
+
+        for (const auto& [key, dense] : rebuilt) {
+            auto found = std::find_if(package.regions.begin(), package.regions.end(), [&](const RegionAsset& asset) {
+                return asset.archive.region_x == key.region[0] && asset.archive.region_y == key.region[1] && asset.archive.region_z == key.region[2];
+                });
+
+            if (found == package.regions.end()) {
+                RegionAsset asset{};
+                asset.ref.coord = key.region;
+                asset.archive.region_x = key.region[0];
+                asset.archive.region_y = key.region[1];
+                asset.archive.region_z = key.region[2];
+                asset.dirty = true;
+                package.regions.push_back(std::move(asset));
+                found = std::prev(package.regions.end());
+            }
+
+            found->archive.set_chunk_voxels_dense(key.chunk[0], key.chunk[1], key.chunk[2],
+                std::span<const uint32_t>(dense.data(), dense.size()), &geometry, VoxelCodec::AUTO,
+                registry.empty() ? nullptr : &registry);
+            found->dirty = true;
+        }
+
+        package.manifest.world_desc.axis_convention = target;
+
+        // Bounds are region coordinates in the old frame, and stale bounds are worse than none.
+        if (package.manifest.world_desc.bounds_mode == BoundsMode::EXPLICIT) {
+            bool first = true;
+            for (const RegionAsset& asset : package.regions) {
+                const auto& d = package.manifest.world_desc;
+                (void)d;
+                auto& out = package.manifest.world_desc;
+                if (first) {
+                    out.world_min_region_x = out.world_max_region_x = asset.archive.region_x;
+                    out.world_min_region_y = out.world_max_region_y = asset.archive.region_y;
+                    out.world_min_region_z = out.world_max_region_z = asset.archive.region_z;
+                    first = false;
+                    continue;
+                }
+                out.world_min_region_x = std::min(out.world_min_region_x, asset.archive.region_x);
+                out.world_min_region_y = std::min(out.world_min_region_y, asset.archive.region_y);
+                out.world_min_region_z = std::min(out.world_min_region_z, asset.archive.region_z);
+                out.world_max_region_x = std::max(out.world_max_region_x, asset.archive.region_x);
+                out.world_max_region_y = std::max(out.world_max_region_y, asset.archive.region_y);
+                out.world_max_region_z = std::max(out.world_max_region_z, asset.archive.region_z);
+            }
+            if (first) package.manifest.world_desc.bounds_mode = BoundsMode::UNBOUNDED;
+        }
+
+        return moved;
+    }
+
+    std::vector<ValidationIssue> Parser::validate(const WorldPackage& package, const ValidateOptions& options)
+    {
+        std::vector<ValidationIssue> issues;
+        const auto& desc = package.manifest.world_desc;
+
+        const auto add = [&](Severity severity, ValidationCode code, std::string message, int64_t region = -1, int64_t chunk = -1, uint32_t key = 0) {
+            issues.push_back(ValidationIssue{ severity, code, region, chunk, key, std::move(message) });
+            };
+        const auto tick = [&](std::string_view stage, size_t done, size_t total) {
+            if (options.progress && !options.progress(stage, done, total)) throw CancelledError{};
+            };
+
+        const auto& g = desc.geometry;
+        if (g.chunk_size_x == 0 || g.chunk_size_y == 0 || g.chunk_size_z == 0 || g.region_size_x == 0 || g.region_size_y == 0 || g.region_size_z == 0) {
+            add(Severity::ERROR, ValidationCode::GEOMETRY_INVALID, "geometry has a zero dimension");
+            return issues;   // nothing below can be checked meaningfully
+        }
+        if (g.chunk_size_x > 255 || g.chunk_size_y > 255 || g.chunk_size_z > 255) {
+            add(Severity::ERROR, ValidationCode::GEOMETRY_INVALID, "chunk dimensions must be <= 255 (summary AABBs are 8-bit)");
+        }
+
+        // --- registry ------------------------------------------------------------------------
+        std::unordered_set<uint32_t> known_keys;
+        for (const bvx::RegistryEntry& entry : desc.registry_entries) {
+            if (entry.voxel_key == 0u) {
+                add(Severity::WARNING, ValidationCode::AIR_KEY_REGISTERED, "voxel key 0 is air by convention and should not be registered", -1, -1, 0);
+            }
+            if (!known_keys.insert(entry.voxel_key).second) {
+                add(Severity::ERROR, ValidationCode::DUPLICATE_VOXEL_KEY, "duplicate registry entry for voxel key " + std::to_string(entry.voxel_key), -1, -1, entry.voxel_key);
+            }
+        }
+        if (desc.registry_entries.empty()) {
+            add(Severity::WARNING, ValidationCode::REGISTRY_EMPTY, "world has no registry: every non-air voxel will be summarised as opaque");
+        }
+        if (desc.units.is_default()) {
+            add(Severity::INFO, ValidationCode::UNITS_UNSET, "world uses the default 1.0 voxel size and a zero origin");
+        }
+
+        // --- textures and materials ------------------------------------------------------------
+        std::unordered_set<uint32_t> known_materials;
+        for (size_t i = 0; i < package.textures.size(); ++i) {
+            tick("textures", i, package.textures.size());
+
+            const TextureAsset& asset = package.textures[i];
+            for (const ValidationError& err : asset.archive.validate()) {
+                add(Severity::ERROR, ValidationCode::TEXTURE_ARCHIVE_INVALID, "texture '" + asset.ref.id + "': " + err.message);
+            }
+            for (const auto& material : asset.archive.materials) known_materials.insert(material.material_id);
+
+            const std::string path_str = (package.manifest.textures_dir / asset.ref.relative_path).generic_string();
+            if (path_str.size() > bvx::BTX_REF_PATH_CAPACITY) {
+                add(Severity::ERROR, ValidationCode::TEXTURE_PATH_TOO_LONG,
+                    "texture path is longer than " + std::to_string(bvx::BTX_REF_PATH_CAPACITY) + " characters and cannot be referenced: " + path_str);
+            }
+        }
+        if (package.textures.empty() && !desc.registry_entries.empty()) {
+            add(Severity::INFO, ValidationCode::NO_TEXTURES, "world has registry entries but no .btx: voxel keys resolve to no material");
+        }
+        for (const bvx::RegistryEntry& entry : desc.registry_entries) {
+            if (entry.voxel_key == 0u || package.textures.empty()) continue;
+            if (!known_materials.contains(entry.material_id)) {
+                add(Severity::WARNING, ValidationCode::MATERIAL_NOT_FOUND,
+                    "voxel key " + std::to_string(entry.voxel_key) + " refers to material_id " + std::to_string(entry.material_id) + ", which no .btx defines",
+                    -1, -1, entry.voxel_key);
+            }
+        }
+
+        // --- regions and chunks -----------------------------------------------------------------
+        std::map<std::array<int32_t, 3>, size_t> seen_coords;
+        for (size_t r = 0; r < package.regions.size(); ++r) {
+            tick("regions", r, package.regions.size());
+
+            const bvx::Archive& archive = package.regions[r].archive;
+            const std::array<int32_t, 3> coord{ archive.region_x, archive.region_y, archive.region_z };
+
+            if (const auto found = seen_coords.find(coord); found != seen_coords.end()) {
+                add(Severity::ERROR, ValidationCode::DUPLICATE_REGION_COORD,
+                    "region " + std::to_string(r) + " sits at the same coordinate as region " + std::to_string(found->second),
+                    static_cast<int64_t>(r));
+            }
+            else {
+                seen_coords.emplace(coord, r);
+            }
+
+            if (desc.bounds_mode == BoundsMode::EXPLICIT) {
+                const bool inside =
+                    coord[0] >= desc.world_min_region_x && coord[0] <= desc.world_max_region_x &&
+                    coord[1] >= desc.world_min_region_y && coord[1] <= desc.world_max_region_y &&
+                    coord[2] >= desc.world_min_region_z && coord[2] <= desc.world_max_region_z;
+                if (!inside) {
+                    add(Severity::WARNING, ValidationCode::REGION_OUT_OF_BOUNDS,
+                        "region (" + std::to_string(coord[0]) + ", " + std::to_string(coord[1]) + ", " + std::to_string(coord[2]) + ") lies outside the declared bounds",
+                        static_cast<int64_t>(r));
+                }
+            }
+
+            if (archive.chunk_map.empty()) {
+                add(Severity::INFO, ValidationCode::EMPTY_REGION, "region " + std::to_string(r) + " holds no chunks", static_cast<int64_t>(r));
+                continue;
+            }
+
+            for (size_t c = 0; c < archive.chunk_map.size(); ++c) {
+                const bvx::ChunkMapEntry& chunk = archive.chunk_map[c];
+                if (chunk.local_chunk_x >= g.region_size_x || chunk.local_chunk_y >= g.region_size_y || chunk.local_chunk_z >= g.region_size_z) {
+                    add(Severity::ERROR, ValidationCode::CHUNK_OUT_OF_REGION,
+                        "chunk (" + std::to_string(chunk.local_chunk_x) + ", " + std::to_string(chunk.local_chunk_y) + ", " + std::to_string(chunk.local_chunk_z) + ") lies outside the region's chunk grid",
+                        static_cast<int64_t>(r), static_cast<int64_t>(c));
+                }
+
+                // The cheap pass only sees the four dominant keys a summary records. The deep pass
+                // decodes and catches every key actually present.
+                std::vector<uint32_t> keys;
+                if (options.deep) {
+                    keys = archive.decode_chunk_voxels(chunk.local_chunk_x, chunk.local_chunk_y, chunk.local_chunk_z, &g);
+                }
+                else if (chunk.summary_index < archive.chunk_summaries.size()) {
+                    const bvx::ChunkSummary& sum = archive.chunk_summaries[chunk.summary_index];
+                    keys = { sum.top_id_0, sum.top_id_1, sum.top_id_2, sum.top_id_3 };
+                }
+
+                std::unordered_set<uint32_t> reported;
+                for (uint32_t key : keys) {
+                    if (key == 0u || !reported.insert(key).second) continue;
+                    if (known_keys.contains(key)) continue;
+                    add(Severity::WARNING, ValidationCode::VOXEL_KEY_NOT_IN_REGISTRY,
+                        "voxel key " + std::to_string(key) + " is used but not registered",
+                        static_cast<int64_t>(r), static_cast<int64_t>(c), key);
+                }
+            }
+        }
+
+        return issues;
+    }
+
+    void Parser::save_region(const WorldPackage& package, const std::filesystem::path& region_path_in, const SaveOptions& options)
     {
         std::vector<std::filesystem::path> texture_file_names;
         const bvx::Archive archive = build_standalone_region(package, &texture_file_names);
 
+        FileWriter& writer = options.writer ? *options.writer : native_filewriter();
+        const bool native = options.writer == nullptr;
+
         std::filesystem::path region_path = region_path_in;
         if (!region_path.has_extension()) {
-            std::filesystem::create_directories(region_path);
             const auto default_name = choose_region_relative_path(package.regions.front(), 0).filename();
             region_path /= default_name.empty() ? std::filesystem::path("region.bvx") : default_name;
         }
 
-        region_path = std::filesystem::absolute(region_path).lexically_normal();
+        // Only a native path can be made absolute -- a host VFS path has its own root, and
+        // std::filesystem::absolute would prepend this process's working directory to it.
+        if (native) region_path = std::filesystem::absolute(region_path).lexically_normal();
         const auto root_dir = region_path.parent_path();
-        std::filesystem::create_directories(root_dir);
+
+        if (options.dry_run) return;
+
+        writer.make_directories(root_dir);
 
         for (size_t i = 0; i < package.textures.size(); ++i) {
             const auto out_path = (root_dir / texture_file_names[i]).lexically_normal();
-            if (!package.textures[i].archive.save_to_file(out_path.string())) {
-                throw std::runtime_error("[bsvx]: Parser: failed writing standalone .btx: " + out_path.string());
-            }
+            const auto bytes = package.textures[i].archive.serialize_to_bytes();
+            writer.write_file(out_path, std::span<const std::byte>(bytes.data(), bytes.size()), options.atomic, options.backup);
         }
 
-        ensure_parent_dir(region_path);
-        if (!archive.save_to_file(region_path.string())) {
-            throw std::runtime_error("[bsvx]: Parser: failed writing standalone .bvx: " + region_path.string());
-        }
+        writer.make_directories(region_path.parent_path());
+        const auto bytes = archive.serialize_to_bytes();
+        writer.write_file(region_path, std::span<const std::byte>(bytes.data(), bytes.size()), options.atomic, options.backup);
     }
 
 } // namespace voxel
