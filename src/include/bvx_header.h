@@ -1,6 +1,7 @@
 #pragma once
 #include "definitions.h"
 #include "util.h"
+#include <cstddef>   // offsetof, used by the SectionRecord layout assertions below
 #include <unordered_map>
 
 namespace bsvx::bvx {

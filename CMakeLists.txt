@@ -34,11 +34,32 @@ if(BSVX_STATIC_CXX_RUNTIME AND NOT MSVC)
     target_link_options(bsvx PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
-set_source_files_properties(
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/impl/toml_impl.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/impl/toml.hpp"
-  PROPERTIES COMPILE_OPTIONS "-Wno-deprecated-literal-operator"
-)
+# Vendored toml++ uses `operator"" _toml`, whose space before the suffix is deprecated in C++23.
+# The warning is not actionable in third-party code, so it is silenced for those two files only.
+#
+# MSVC must be excluded, and not merely because it does not need it: cl translates -W into its own
+# /W warning-*level* flag and then rejects "no-deprecated-literal-operator" as a non-numeric level
+# (command line error D8021), which fails the build outright rather than being ignored.
+if(NOT MSVC)
+    set_source_files_properties(
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/impl/toml_impl.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/impl/toml.hpp"
+      PROPERTIES COMPILE_OPTIONS "-Wno-deprecated-literal-operator"
+    )
+endif()
+
+if(MSVC)
+    # The test suite and this library both carry UTF-8 source (u8"" literals with non-ASCII text).
+    # Without /utf-8 cl decodes the source in the active code page, which mangles them and emits
+    # C4819. /utf-8 also sets the execution charset, which is what the "paths are UTF-8" contract
+    # assumes.
+    target_compile_options(bsvx PRIVATE /utf-8)
+    # toml++ is large enough to exhaust the default object-file section limit.
+    target_compile_options(bsvx PRIVATE /bigobj)
+    # Without this cl reports __cplusplus as 199711L regardless of /std, which makes the value
+    # bsvx_build_info() prints a lie and breaks any feature test that reads it.
+    target_compile_options(bsvx PRIVATE /Zc:__cplusplus)
+endif()
 
 message(STATUS "Writing .clangd to ${CMAKE_CURRENT_SOURCE_DIR}/.clangd")
 file(RELATIVE_PATH CLANGD_BUILD_DIR
@@ -56,6 +77,10 @@ if(BSVX_BUILD_TESTS)
     add_executable(bsvx_tests "${CMAKE_CURRENT_SOURCE_DIR}/test/tests.cpp")
     target_link_libraries(bsvx_tests PRIVATE bsvx)
     target_compile_definitions(bsvx_tests PRIVATE BSVX_ASSETS_USE_DLL)
+    if(MSVC)
+        # test_non_ascii_paths has UTF-8 literals in the source; see above.
+        target_compile_options(bsvx_tests PRIVATE /utf-8)
+    endif()
 
     enable_testing()
     add_test(NAME bsvx_tests COMMAND bsvx_tests WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
