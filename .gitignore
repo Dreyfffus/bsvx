@@ -443,3 +443,9 @@ dist/
 # something to carry in history. .godot/ is the editor's own per-machine cache.
 integrations/godot/build-*/
 integrations/godot/project/.godot/
+
+# Premake outputs. The Visual Studio ones are already covered by *.sln / *.vcxproj above; these are
+# the gmake action's equivalents, and are rooted so they cannot swallow a hand-written Makefile in
+# a subdirectory.
+/Makefile
+/*.make

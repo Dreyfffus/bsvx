@@ -1,6 +1,11 @@
 """Headless test for the BSVX add-on.
 
-    blender --background --python integrations/blender/tests/test_headless.py
+    blender --factory-startup --background --python integrations/blender/tests/test_headless.py
+
+--factory-startup matters once the add-on is also installed: without it Blender enables the
+installed copy first, this script registers a second copy of the same classes over it, and the
+teardown of whichever one loses raises. The checks still pass, but the noise is real and the
+shadowing is not something to rely on.
 
 Exits non-zero on the first failure. Everything here runs through the real operators against a real
 world on disk -- the coordinate mapping is checked against the library's own ``convert_cell``, and

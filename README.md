@@ -144,8 +144,22 @@ g++ -std=c++23 -O2 -fPIC -shared \
     src/impl/*.cpp -o libbsvx.so
 ```
 
-The MSVC files (`Build.lua`, `premake/`, `build.bat`, `*.vcxproj`, `bsvx.sln`) and the prebuilt
-`Binaries/` are Windows-only leftovers and are not part of the CMake build.
+Or with premake, which generates a Visual Studio solution without CMake in the picture, and
+makefiles everywhere else:
+
+```bash
+premake\premake5.exe --file=Build.lua vs2022     # what build.bat runs
+premake5 --file=Build.lua gmake2 && make -j      # Linux/macOS
+```
+
+`Build.lua` mirrors the CMake decisions rather than inventing its own — same MSVC flags, same
+static/shared choice (`--static-lib`), and the same staging into `python/bsvx/bin/<platform>/` that
+the Python binding and the Blender add-on rely on. `--help` lists its options. CMake remains the
+primary build and the one CI runs; a build definition that is never exercised is a build definition
+that is already broken, so premake is verified against the same test suite.
+
+Generated projects (`*.vcxproj`, `bsvx.sln`, `Makefile`, `*.make`) and `Binaries/` are outputs, not
+sources, and are gitignored.
 
 `CXX_VISIBILITY_PRESET hidden` is deliberate: it keeps the exported surface to exactly the `bsvx_*` C
 functions.

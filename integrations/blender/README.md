@@ -112,8 +112,12 @@ overrides the search.
 ## Verifying
 
 ```sh
-blender --background --python integrations/blender/tests/test_headless.py
+blender --factory-startup --background --python integrations/blender/tests/test_headless.py
 ```
+
+`--factory-startup` is not optional once you have also installed the add-on: otherwise Blender
+enables the installed copy, the script registers a second copy of the same classes over it, and
+the teardown of whichever one loses raises on exit.
 
 98 checks covering the axis mapping against the library's own `convert_cell`, the cell/point round
 trip, authoring and reopening a world from disk, checkout → edit in bmesh → commit (including that
