@@ -956,7 +956,13 @@ Rules that save pain later:
 > [`integrations/blender/`](integrations/blender/), and its README is the current reference for how
 > it actually works. Two decisions in this section were refined by building it, and the refinements
 > are noted inline: a voxel *is* materialised as Blender geometry, but only a bounded **working
-> set** of it at a time, and that geometry is a point mesh rather than an empty-per-region proxy.
+> set** of it at a time, and that geometry is a **cube mesh** rather than an empty-per-region proxy.
+>
+> The scope also narrowed on purpose. The add-on authors, exports and writes; it does not edit.
+> Blender already has voxel editors — Vox Cleaner, Vox Tools, the `.vox` importers — and they all
+> operate on cube meshes with one material per palette entry. Producing that shape is worth more
+> than any editing UI this add-on could have grown, and it is why the representation is a cube and
+> not the cheaper vertex-per-voxel the first version used.
 
 ### 7.1 How a world lives in Blender
 
@@ -969,10 +975,12 @@ Blender's mesh datablocks will not survive it and neither will the user's sessio
 - Blender objects act as **proxies**: one empty per region with the region coordinate in custom
   properties, optionally a decimated preview mesh per region generated on demand.
 
-  **As shipped:** a proxy that cannot be edited is not much of an editor, so the proxy became a
-  *checked-out working set* — one vertex per non-air voxel, its key in a `bsvx_key` POINT attribute,
-  bounded by a box the object records and a vertex budget the user sets. Committing replaces that
-  box, which is what makes deleting a vertex mean deleting a voxel. See
+  **As shipped:** a proxy nothing else can consume is not worth much, so the proxy became a
+  *checked-out working set* materialised as a **cube mesh** — one culled, welded cube per non-air
+  voxel, its key in a `bsvx_key` FACE attribute, one material slot per key, bounded by a box the
+  object records and a voxel budget the user sets. Importing replaces that box, which is what makes
+  deleting geometry delete voxels; the interior a culled shell lost is rebuilt exactly by face
+  parity rather than guessed. See
   [`integrations/blender/README.md`](integrations/blender/README.md).
 - Authoring happens through **operators** that read Blender data and push voxels through the C API
   (B6), not through a persistent Blender-side voxel datablock.

@@ -1,14 +1,18 @@
-"""BSVX for Blender -- save, author, modify and export .bsvx worlds.
+"""BSVX for Blender -- author, export and save .bsvx worlds.
 
-Registration only. What a voxel *is* in Blender is settled in ``working_set.py``; the coordinate
-mapping is settled in ``frame.py``. Everything else is operators over those two.
+Registration only. What a voxel *is* in Blender is settled in ``voxel_mesh.py`` (a cube, in the
+mesh shape the rest of the voxel ecosystem speaks); reading one back is ``mesh_read.py``; the
+coordinate mapping is settled in ``frame.py``. Everything else is operators over those.
+
+Editing is deliberately not here. Vox Cleaner, Vox Tools and Blender's own tools already do it
+better than a format add-on ever would, so this one's job is the round trip they sit inside.
 """
 
 from __future__ import annotations
 
 import bpy
 
-from . import ops_edit, ops_io, props, session, ui
+from . import ops_io, ops_mesh, ops_world, props, session, ui
 
 bl_info = {
     "name": "BSVX (Basil Voxel)",
@@ -16,11 +20,11 @@ bl_info = {
     "version": (4, 0, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar > BSVX",
-    "description": "Read, author and write BSVX voxel worlds",
+    "description": "Author, export and write BSVX voxel worlds",
     "category": "Import-Export",
 }
 
-_OPERATOR_CLASSES = ops_io.CLASSES + ops_edit.CLASSES
+_OPERATOR_CLASSES = ops_io.CLASSES + ops_mesh.CLASSES + ops_world.CLASSES
 
 
 def _menu_import(self, context):
