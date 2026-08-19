@@ -8,16 +8,42 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include(GNUInstallDirs)
 
+# CMake defines this itself from 3.21 on; the manual form keeps the 3.20 floor.
+if(NOT DEFINED PROJECT_IS_TOP_LEVEL)
+    if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+        set(PROJECT_IS_TOP_LEVEL ON)
+    else()
+        set(PROJECT_IS_TOP_LEVEL OFF)
+    endif()
+endif()
+
+# A host that links bsvx into one loadable module of its own -- a GDExtension, a DCC plugin --
+# wants a single file to ship, not a module plus a sibling .so it has to teach the loader about.
+# Building the library into that module is what STATIC is for; the flat C ABI is unchanged either
+# way, since a static bsvx simply resolves bsvx_* at link time instead of through the loader.
+option(BSVX_BUILD_SHARED "Build bsvx as a shared library (OFF builds a static archive)" ON)
+if(BSVX_BUILD_SHARED)
+    set(BSVX_LIBRARY_TYPE SHARED)
+else()
+    set(BSVX_LIBRARY_TYPE STATIC)
+endif()
+
 file(GLOB BSVX_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/impl/*.cpp")
 
-add_library(bsvx SHARED ${BSVX_SOURCES})
+add_library(bsvx ${BSVX_LIBRARY_TYPE} ${BSVX_SOURCES})
 add_library(bsvx::bsvx ALIAS bsvx)
 
 target_include_directories(bsvx
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/impl")
-target_compile_definitions(bsvx PRIVATE TOML_HEADER_ONLY=0 BSVX_ASSETS_BUILD_DLL)
+target_compile_definitions(bsvx PRIVATE TOML_HEADER_ONLY=0)
+if(BSVX_BUILD_SHARED)
+    # Only meaningful on Windows, where it turns BSVX_API into __declspec(dllexport). A static
+    # bsvx must not carry it: consumers include the same header without BSVX_ASSETS_USE_DLL, and
+    # an exported-but-not-imported symbol is a link error rather than a warning.
+    target_compile_definitions(bsvx PRIVATE BSVX_ASSETS_BUILD_DLL)
+endif()
 set_target_properties(bsvx PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON
@@ -61,22 +87,29 @@ if(MSVC)
     target_compile_options(bsvx PRIVATE /Zc:__cplusplus)
 endif()
 
-message(STATUS "Writing .clangd to ${CMAKE_CURRENT_SOURCE_DIR}/.clangd")
-file(RELATIVE_PATH CLANGD_BUILD_DIR
-  "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}"
-)
+# Skipped in a subproject build: the generated .clangd points at CMAKE_BINARY_DIR, which then
+# belongs to the superproject, and writing it would repoint this repo's tooling at a build tree
+# that only exists while the superproject is configured.
+if(PROJECT_IS_TOP_LEVEL)
+    message(STATUS "Writing .clangd to ${CMAKE_CURRENT_SOURCE_DIR}/.clangd")
+    file(RELATIVE_PATH CLANGD_BUILD_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}"
+    )
 
-configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/.clangd.in"
-  "${CMAKE_CURRENT_SOURCE_DIR}/.clangd"
-  @ONLY
-)
+    configure_file(
+      "${CMAKE_CURRENT_SOURCE_DIR}/.clangd.in"
+      "${CMAKE_CURRENT_SOURCE_DIR}/.clangd"
+      @ONLY
+    )
+endif()
 
-option(BSVX_BUILD_TESTS "Build the fixture-driven test runner" ON)
+option(BSVX_BUILD_TESTS "Build the fixture-driven test runner" ${PROJECT_IS_TOP_LEVEL})
 if(BSVX_BUILD_TESTS)
     add_executable(bsvx_tests "${CMAKE_CURRENT_SOURCE_DIR}/test/tests.cpp")
     target_link_libraries(bsvx_tests PRIVATE bsvx)
-    target_compile_definitions(bsvx_tests PRIVATE BSVX_ASSETS_USE_DLL)
+    if(BSVX_BUILD_SHARED)
+        target_compile_definitions(bsvx_tests PRIVATE BSVX_ASSETS_USE_DLL)
+    endif()
     if(MSVC)
         # test_non_ascii_paths has UTF-8 literals in the source; see above.
         target_compile_options(bsvx_tests PRIVATE /utf-8)
@@ -89,6 +122,10 @@ endif()
 # ------------------------------------------------------------------------------------------------
 # Install / package
 # ------------------------------------------------------------------------------------------------
+
+# A superproject installs its own module, not this one -- and the export set below would collide
+# with whatever export set the superproject defines.
+if(PROJECT_IS_TOP_LEVEL)
 
 # Only bsvx_dll.h is a stable boundary; the rest are the C++ internals and are installed alongside
 # it for consumers that link the library into their own binary.
@@ -121,12 +158,15 @@ install(FILES
     "${CMAKE_CURRENT_BINARY_DIR}/bsvxConfigVersion.cmake"
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/bsvx")
 
+endif() # PROJECT_IS_TOP_LEVEL
+
 # ------------------------------------------------------------------------------------------------
 # Python binding: stage the built shared library where the package expects to find it
 # ------------------------------------------------------------------------------------------------
 
+# The ctypes binding loads a shared library, so there is nothing to stage from a static build.
 option(BSVX_STAGE_PYTHON "Copy the built library into python/bsvx/bin/<platform>/ after building" ON)
-if(BSVX_STAGE_PYTHON)
+if(BSVX_STAGE_PYTHON AND BSVX_BUILD_SHARED AND PROJECT_IS_TOP_LEVEL)
     if(WIN32)
         set(BSVX_PY_PLATFORM "windows_x86_64")
     elseif(APPLE)

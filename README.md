@@ -150,6 +150,28 @@ The MSVC files (`Build.lua`, `premake/`, `build.bat`, `*.vcxproj`, `bsvx.sln`) a
 `CXX_VISIBILITY_PRESET hidden` is deliberate: it keeps the exported surface to exactly the `bsvx_*` C
 functions.
 
+Two options matter to anyone embedding the library rather than shipping it beside their binary.
+`BSVX_BUILD_SHARED=OFF` builds a static archive instead — what a host wants when the library is
+linked into one loadable module of its own, so there is a single file to distribute and no rpath to
+arrange. `BSVX_STATIC_CXX_RUNTIME=ON` links libstdc++/libgcc statically, which keeps a shared build
+from fighting whatever older runtime the host process already has mapped in.
+
+---
+
+## Integrations
+
+`integrations/` holds host plugins built on the C ABI. Each owns its own packaging and its host's
+plugin manifest; none of them extend the format.
+
+- **[`integrations/godot/`](integrations/godot/)** — a GDExtension exposing `BsvxWorld`, a Godot
+  `Resource` that loads, authors and saves worlds. `godot-cpp` is its only submodule; bsvx is linked
+  statically from this repository. It is the format layer only — no meshing, no baking, no
+  generation — so several renderers can sit on top of the same worlds.
+- **[`integrations/blender/`](integrations/blender/)** — a Blender 4.2+ add-on for opening,
+  authoring, modifying and writing worlds, built on the ctypes binding. A voxel is a **vertex** with
+  a `bsvx_key` integer attribute, checked out from the world a bounded box at a time, so Blender's
+  own editing tools operate on voxels directly.
+
 ---
 
 ## The public API

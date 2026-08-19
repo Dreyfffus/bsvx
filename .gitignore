@@ -437,3 +437,9 @@ dist/
 
 .clangd
 .clang-format
+
+# Godot integration. The built extension lands in project/addons/bsvx/bin/, which the
+# "**/[Bb]in/*" rule above already covers -- a GDExtension binary is a release artifact, not
+# something to carry in history. .godot/ is the editor's own per-machine cache.
+integrations/godot/build-*/
+integrations/godot/project/.godot/

@@ -952,16 +952,28 @@ Rules that save pain later:
 
 ## 7. Add-on architecture
 
+> **Shipped.** The add-on described below now exists at
+> [`integrations/blender/`](integrations/blender/), and its README is the current reference for how
+> it actually works. Two decisions in this section were refined by building it, and the refinements
+> are noted inline: a voxel *is* materialised as Blender geometry, but only a bounded **working
+> set** of it at a time, and that geometry is a point mesh rather than an empty-per-region proxy.
+
 ### 7.1 How a world lives in Blender
 
-Do **not** materialise voxels as Blender geometry. A 512³ world is 134 M voxels; Blender's mesh
-datablocks will not survive it and neither will the user's session. Instead:
+Do **not** materialise the *whole* world as Blender geometry. A 512³ world is 134 M voxels;
+Blender's mesh datablocks will not survive it and neither will the user's session. Instead:
 
 - The world is an **add-on-owned handle** (a `bsvx_world*`) held in a module-level registry, keyed by
   an id stored in a scene `PropertyGroup`. It does not survive a `.blend` reload — the add-on
   re-opens the world from its recorded path on load, or asks.
 - Blender objects act as **proxies**: one empty per region with the region coordinate in custom
   properties, optionally a decimated preview mesh per region generated on demand.
+
+  **As shipped:** a proxy that cannot be edited is not much of an editor, so the proxy became a
+  *checked-out working set* — one vertex per non-air voxel, its key in a `bsvx_key` POINT attribute,
+  bounded by a box the object records and a vertex budget the user sets. Committing replaces that
+  box, which is what makes deleting a vertex mean deleting a voxel. See
+  [`integrations/blender/README.md`](integrations/blender/README.md).
 - Authoring happens through **operators** that read Blender data and push voxels through the C API
   (B6), not through a persistent Blender-side voxel datablock.
 - The palette is a `CollectionProperty` of `(voxel_key, name, color, flags, material_id)` mirrored

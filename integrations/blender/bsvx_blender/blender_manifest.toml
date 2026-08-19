@@ -1,0 +1,19 @@
+schema_version = "1.0.0"
+
+id = "bsvx"
+version = "4.0.0"
+name = "BSVX (Basil Voxel)"
+tagline = "Read, author and write BSVX voxel worlds"
+maintainer = "bsvx"
+type = "add-on"
+
+website = "https://github.com/Dreyfffus/bsvx"
+tags = ["Import-Export", "3D View"]
+
+blender_version_min = "4.2.0"
+license = ["SPDX:Unlicense"]
+
+# The ctypes binding and libbsvx are copied into _vendor/ by package.py. They are not wheels: the
+# binding is pure Python by design, precisely so it imports into whatever interpreter a host ships.
+[permissions]
+files = "Read and write .bsvx worlds chosen by the user"

@@ -1,0 +1,24 @@
+[configuration]
+
+entry_symbol = "bsvx_library_init"
+compatibility_minimum = "4.4"
+reloadable = true
+
+[libraries]
+
+; The editor and the debug export template both load the template_debug build: nothing here uses
+; an editor-only API, so a separate editor target would be a third binary for no gain.
+linux.editor.x86_64    = "res://addons/bsvx/bin/libbsvx_godot.linux.template_debug.x86_64.so"
+linux.debug.x86_64     = "res://addons/bsvx/bin/libbsvx_godot.linux.template_debug.x86_64.so"
+linux.release.x86_64   = "res://addons/bsvx/bin/libbsvx_godot.linux.template_release.x86_64.so"
+linux.editor.arm64     = "res://addons/bsvx/bin/libbsvx_godot.linux.template_debug.arm64.so"
+linux.debug.arm64      = "res://addons/bsvx/bin/libbsvx_godot.linux.template_debug.arm64.so"
+linux.release.arm64    = "res://addons/bsvx/bin/libbsvx_godot.linux.template_release.arm64.so"
+
+windows.editor.x86_64  = "res://addons/bsvx/bin/libbsvx_godot.windows.template_debug.x86_64.dll"
+windows.debug.x86_64   = "res://addons/bsvx/bin/libbsvx_godot.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/bsvx/bin/libbsvx_godot.windows.template_release.x86_64.dll"
+
+macos.editor           = "res://addons/bsvx/bin/libbsvx_godot.macos.template_debug.framework"
+macos.debug            = "res://addons/bsvx/bin/libbsvx_godot.macos.template_debug.framework"
+macos.release          = "res://addons/bsvx/bin/libbsvx_godot.macos.template_release.framework"
