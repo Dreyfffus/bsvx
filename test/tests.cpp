@@ -1737,6 +1737,104 @@ namespace {
         REQUIRE_EQ(bsvx_world_get_validation_issue(ctx.get(), issues, &issue), BSVX_RESULT_NOT_FOUND);
     }
 
+    // Non-cubic chunks, a non-cubic region, and unoccupied slots between the occupied ones -- the
+    // geometry the whole-region decode's stride arithmetic is easiest to get wrong on, and one the
+    // fixture world (cubic chunks, every slot filled) never reaches. Run twice: once with content
+    // sparse enough that the chunks encode through the codecs that describe only occupied voxels,
+    // once dense enough that they encode through the ones that define every voxel. Whole-region
+    // decode clears the destination differently for those two cases.
+    void test_decode_all_non_cubic_with_holes()
+    {
+        Context ctx;
+        const bsvx_geometry_desc geometry{ 3, 5, 7, 4, 2, 3 };
+        const size_t per_chunk = 3u * 5u * 7u;
+        const size_t span_x = 3u * 4u;
+        const size_t span_y = 5u * 2u;
+
+        const auto is_hole = [](uint16_t cx, uint16_t cy, uint16_t cz) { return ((cx + cy + cz) % 3u) == 0u; };
+
+        for (int dense_pass = 0; dense_pass < 2; ++dense_pass) {
+            bsvx_world* raw = nullptr;
+            REQUIRE_EQ(bsvx_world_create(ctx.get(), &geometry, &raw), BSVX_RESULT_OK);
+            World world(raw);
+
+            bsvx_registry_entry stone{ 1u, 0u, 1u, 0u };
+            bsvx_registry_entry dirt{ 2u, 0u, 1u, 0u };
+            REQUIRE_EQ(bsvx_world_set_registry_entry(world.get(), &stone), BSVX_RESULT_OK);
+            REQUIRE_EQ(bsvx_world_set_registry_entry(world.get(), &dirt), BSVX_RESULT_OK);
+
+            size_t region = 0;
+            REQUIRE_EQ(bsvx_world_add_region(world.get(), 0, 0, 0, &region), BSVX_RESULT_OK);
+
+            size_t authored = 0;
+            for (uint16_t cz = 0; cz < 3; ++cz) {
+                for (uint16_t cy = 0; cy < 2; ++cy) {
+                    for (uint16_t cx = 0; cx < 4; ++cx) {
+                        if (is_hole(cx, cy, cz)) continue;
+
+                        std::vector<uint32_t> dense(per_chunk, 0u);
+                        for (size_t i = 0; i < per_chunk; ++i) {
+                            if (dense_pass == 1) dense[i] = 1u + static_cast<uint32_t>((i + cx) % 2u);
+                            else if ((i % 11u) == cy) dense[i] = 1u + static_cast<uint32_t>(i % 2u);
+                        }
+                        REQUIRE_EQ(bsvx_region_set_chunk_u32_ex(ctx.get(), world.get(), region, cx, cy, cz,
+                            dense.data(), dense.size(), 0xFFFFu), BSVX_RESULT_OK);
+                        ++authored;
+                    }
+                }
+            }
+            REQUIRE(authored > 0u);
+            REQUIRE(authored < 4u * 2u * 3u);   // there really are holes to get wrong
+
+            size_t needed = 0;
+            REQUIRE_EQ(bsvx_region_decode_all_u32(ctx.get(), world.get(), region, BSVX_LAYOUT_REGION_LINEAR, nullptr, 0, &needed), BSVX_RESULT_BUFFER_TOO_SMALL);
+            REQUIRE_EQ(needed, per_chunk * 4u * 2u * 3u);
+
+            // Poisoned, because an unoccupied slot has to be *written* as air rather than left as
+            // whatever the caller's buffer already held.
+            std::vector<uint32_t> linear(needed, 0xDEADBEEFu);
+            REQUIRE_EQ(bsvx_region_decode_all_u32(ctx.get(), world.get(), region, BSVX_LAYOUT_REGION_LINEAR, linear.data(), linear.size(), &needed), BSVX_RESULT_OK);
+
+            for (uint16_t cz = 0; cz < 3; ++cz) {
+                for (uint16_t cy = 0; cy < 2; ++cy) {
+                    for (uint16_t cx = 0; cx < 4; ++cx) {
+                        const std::vector<uint32_t> expected = is_hole(cx, cy, cz)
+                            ? std::vector<uint32_t>(per_chunk, 0u)
+                            : decode_chunk(world, region, cx, cy, cz);
+
+                        for (uint16_t z = 0; z < 7; ++z) {
+                            for (uint16_t y = 0; y < 5; ++y) {
+                                for (uint16_t x = 0; x < 3; ++x) {
+                                    const size_t wx = static_cast<size_t>(cx) * 3u + x;
+                                    const size_t wy = static_cast<size_t>(cy) * 5u + y;
+                                    const size_t wz = static_cast<size_t>(cz) * 7u + z;
+                                    const size_t src = x + 3u * (y + 5u * static_cast<size_t>(z));
+                                    REQUIRE_EQ(linear[wx + span_x * (wy + span_y * wz)], expected[src]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Chunk order writes every element it reports, so a poisoned buffer must come back
+            // fully overwritten there too.
+            REQUIRE_EQ(bsvx_region_decode_all_u32(ctx.get(), world.get(), region, BSVX_LAYOUT_CHUNK_ORDER, nullptr, 0, &needed), BSVX_RESULT_BUFFER_TOO_SMALL);
+            REQUIRE_EQ(needed, per_chunk * authored);
+
+            std::vector<uint32_t> ordered(needed, 0xDEADBEEFu);
+            REQUIRE_EQ(bsvx_region_decode_all_u32(ctx.get(), world.get(), region, BSVX_LAYOUT_CHUNK_ORDER, ordered.data(), ordered.size(), &needed), BSVX_RESULT_OK);
+
+            std::vector<bsvx_chunk_info> infos(authored);
+            size_t written = 0;
+            REQUIRE_EQ(bsvx_region_get_chunk_infos(world.get(), region, 0, authored, infos.data(), &written), BSVX_RESULT_OK);
+            for (size_t i = 0; i < authored; ++i) {
+                const auto one = decode_chunk(world, region, infos[i].local_chunk_x, infos[i].local_chunk_y, infos[i].local_chunk_z);
+                for (size_t v = 0; v < per_chunk; ++v) REQUIRE_EQ(ordered[i * per_chunk + v], one[v]);
+            }
+        }
+    }
+
     void test_bulk_accessors()
     {
         Context ctx;
@@ -2524,6 +2622,7 @@ int main()
     failures += run_test("atomic_save_and_backup", test_atomic_save_and_backup);
     failures += run_test("validation", test_validation);
     failures += run_test("bulk_accessors", test_bulk_accessors);
+    failures += run_test("decode_all_non_cubic_with_holes", test_decode_all_non_cubic_with_holes);
     failures += run_test("chunk_content_hash", test_chunk_content_hash);
     failures += run_test("texture_authoring", test_texture_authoring);
     failures += run_test("paths_and_progress", test_paths_and_progress);

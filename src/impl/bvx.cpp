@@ -205,25 +205,45 @@ namespace bsvx::bvx {
 		if (out_entry_flags) *out_entry_flags = entry.flags;
 		return std::span<const std::byte>(sec->blob.data() + entry.offset, entry.size);
 	}
-	std::vector<uint32_t> Archive::decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const GeometryDesc* geometry_override) const
+	void Archive::decode_chunk_voxels_into(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, std::span<uint32_t> out, const GeometryDesc* geometry_override) const
 	{
 		const GeometryDesc g = resolve_geometry(geometry_override);
-		const size_t voxel_count = chunk_voxel_count(g);
+		decode_chunk_voxels_into(chunk_x, chunk_y, chunk_z, contiguous_dest(out, g.chunk_size_x, g.chunk_size_y, g.chunk_size_z), &g);
+	}
+
+	void Archive::decode_chunk_voxels_into(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const VoxelDest& dest, const GeometryDesc* geometry_override) const
+	{
+		const GeometryDesc g = resolve_geometry(geometry_override);
+		if (dest.voxel_count() != chunk_voxel_count(g)) throw std::runtime_error("[bvx]: decode_chunk_voxels_into buffer is the wrong size");
+
 		const auto chunk_index_opt = try_find_chunk_index(chunk_x, chunk_y, chunk_z);
 		if (!chunk_index_opt) throw std::runtime_error("[bvx]: decode_chunk_voxels chunk not found");
 		const uint32_t chunk_index = *chunk_index_opt;
+
+		// A chunk with no voxel entry is air, not an error: a region can carry a chunk that only
+		// holds baked payloads.
 		const PayloadSection* voxels = find_section(SectionType::VOXELS);
 		if (!voxels || chunk_index >= voxels->entries.size()) {
-			return std::vector<uint32_t>(voxel_count, 0u);
+			decode_voxel_payload_into(VoxelCodec::CHUNK_EMPTY, {}, dest);
+			return;
 		}
 
 		const OffsetSizeEntry& entry = voxels->entries[chunk_index];
-		if (entry.offset == INVALID_OFFSET) return std::vector<uint32_t>(voxel_count, 0u);
+		if (entry.offset == INVALID_OFFSET) {
+			decode_voxel_payload_into(VoxelCodec::CHUNK_EMPTY, {}, dest);
+			return;
+		}
 		if (entry.offset + entry.size > voxels->blob.size()) throw std::runtime_error("[bvx]: voxel payload entry out of bounds");
 
 		const auto payload = std::span(voxels->blob.data() + entry.offset, entry.size);
-		return decode_voxel_payload(static_cast<VoxelCodec>(entry.codec), payload, g.chunk_size_x, g.chunk_size_y, g.chunk_size_z);
+		decode_voxel_payload_into(static_cast<VoxelCodec>(entry.codec), payload, dest);
+	}
 
+	std::vector<uint32_t> Archive::decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const GeometryDesc* geometry_override) const
+	{
+		std::vector<uint32_t> out(chunk_voxel_count(resolve_geometry(geometry_override)));
+		decode_chunk_voxels_into(chunk_x, chunk_y, chunk_z, out, geometry_override);
+		return out;
 	}
 	uint64_t Archive::chunk_content_hash(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const GeometryDesc* geometry_override) const
 	{
@@ -816,19 +836,35 @@ namespace bsvx::bvx {
 		}
 		return std::nullopt;
 	}
-	std::vector<uint32_t> RegionReader::decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z) const
+	void RegionReader::decode_chunk_voxels_into(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, std::span<uint32_t> out) const
 	{
 		const GeometryDesc g = resolve_geometry();
-		const size_t voxel_count = Archive::chunk_voxel_count(g);
+		decode_chunk_voxels_into(chunk_x, chunk_y, chunk_z, contiguous_dest(out, g.chunk_size_x, g.chunk_size_y, g.chunk_size_z));
+	}
+
+	void RegionReader::decode_chunk_voxels_into(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const VoxelDest& dest) const
+	{
+		const GeometryDesc g = resolve_geometry();
+		if (dest.voxel_count() != Archive::chunk_voxel_count(g)) throw std::runtime_error("[bvx]: decode_chunk_voxels_into buffer is the wrong size");
 
 		const auto chunk_index = try_find_chunk_index(chunk_x, chunk_y, chunk_z);
 		if (!chunk_index) throw std::runtime_error("[bvx]: decode_chunk_voxels chunk not found");
 
 		uint16_t codec = 0;
 		const auto payload = read_chunk_payload(SectionType::VOXELS, *chunk_index, &codec);
-		if (!payload) return std::vector<uint32_t>(voxel_count, 0u);
+		if (!payload) {
+			decode_voxel_payload_into(VoxelCodec::CHUNK_EMPTY, {}, dest);
+			return;
+		}
 
-		return decode_voxel_payload(static_cast<VoxelCodec>(codec), std::span<const std::byte>(payload->data(), payload->size()), g.chunk_size_x, g.chunk_size_y, g.chunk_size_z);
+		decode_voxel_payload_into(static_cast<VoxelCodec>(codec), std::span<const std::byte>(payload->data(), payload->size()), dest);
+	}
+
+	std::vector<uint32_t> RegionReader::decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z) const
+	{
+		std::vector<uint32_t> out(Archive::chunk_voxel_count(resolve_geometry()));
+		decode_chunk_voxels_into(chunk_x, chunk_y, chunk_z, out);
+		return out;
 	}
 	bool RegionReader::verify_integrity() const
 	{

@@ -261,13 +261,20 @@ namespace {
         clear_error(ctx);
 
         try {
-            const auto dense = region_archive(world, region_index).decode_chunk_voxels(chunk_x, chunk_y, chunk_z, &world_desc(world).geometry);
-            if (voxel_capacity < dense.size()) {
+            const auto& archive = region_archive(world, region_index);
+            const auto& geometry = world_desc(world).geometry;
+            const size_t required = bsvx::bvx::Archive::chunk_voxel_count(geometry);
+
+            if (voxel_capacity < required) {
+                // Decoded rather than answered from the geometry alone: a chunk that does not exist
+                // has to keep surfacing as its own error here, which reporting on size would hide.
+                const auto dense = archive.decode_chunk_voxels(chunk_x, chunk_y, chunk_z, &geometry);
                 if (out_written) *out_written = dense.size();
                 return BSVX_RESULT_BUFFER_TOO_SMALL;
             }
-            for (size_t i = 0; i < dense.size(); ++i) out_voxels[i] = dense[i];
-            if (out_written) *out_written = dense.size();
+
+            archive.decode_chunk_voxels_into(chunk_x, chunk_y, chunk_z, std::span<uint32_t>(out_voxels, required), &geometry);
+            if (out_written) *out_written = required;
             return BSVX_RESULT_OK;
         }
         catch (...) {
@@ -1210,13 +1217,17 @@ extern "C" {
         clear_error(ctx);
 
         try {
-            const auto dense = reader->reader.decode_chunk_voxels(chunk_x, chunk_y, chunk_z);
-            if (voxel_capacity < dense.size()) {
+            const size_t required = bsvx_region_reader_required_voxel_count(reader);
+            if (voxel_capacity < required) {
+                // See impl_decode_chunk: the slow path stays, so a missing chunk still reports as
+                // one instead of as a sizing answer.
+                const auto dense = reader->reader.decode_chunk_voxels(chunk_x, chunk_y, chunk_z);
                 if (out_written) *out_written = dense.size();
                 return BSVX_RESULT_BUFFER_TOO_SMALL;
             }
-            for (size_t i = 0; i < dense.size(); ++i) out_voxels[i] = dense[i];
-            if (out_written) *out_written = dense.size();
+
+            reader->reader.decode_chunk_voxels_into(chunk_x, chunk_y, chunk_z, std::span<uint32_t>(out_voxels, required));
+            if (out_written) *out_written = required;
             return BSVX_RESULT_OK;
         }
         catch (...) {
@@ -2518,37 +2529,103 @@ extern "C" {
             if (voxel_capacity < required) return BSVX_RESULT_BUFFER_TOO_SMALL;
             if (required == 0) return BSVX_RESULT_OK;
 
-            std::fill_n(out_voxels, required, 0u);
-
             const size_t span_x = static_cast<size_t>(g.chunk_size_x) * g.region_size_x;
             const size_t span_y = static_cast<size_t>(g.chunk_size_y) * g.region_size_y;
+
+            // Chunk order puts each chunk in its own contiguous block; region-linear interleaves
+            // them. Either way the decode writes the caller's buffer directly -- the chunk's rows
+            // just land further apart in the second case.
+            //
+            // Neither layout pre-zeroes the whole output. Chunk order does not need to: every
+            // element belongs to exactly one chunk and each decode defines all of its own. Region
+            // linear clears only the slots no chunk occupies, below, which on a densely populated
+            // region is nothing at all.
+            const bool linear = (layout == BSVX_LAYOUT_REGION_LINEAR);
+
+            // Two ways to make the air in this region read as air, and which is cheaper depends on
+            // what the chunks are encoded with.
+            //
+            // The sparse codecs describe only the voxels that are there, so their destination has
+            // to be clear before they write it. Letting each chunk clear its own box means clearing
+            // it through that chunk's strided rows -- for a 256^3 region, a million 64-byte fills,
+            // several times the cost of one flat pass over the same bytes. So when those codecs
+            // cover most of the region, clear the whole output once, sequentially, and tell every
+            // decode the destination is already air.
+            //
+            // When they do not -- a region of dense chunks, which overwrite everything they touch
+            // anyway -- that pass is pure waste, and only the slots no chunk occupies need clearing.
+            bool prezeroed = false;
+
+            if (linear) {
+                size_t sparse_covered = 0;
+                for (const auto& map : reg.chunk_map) {
+                    uint16_t codec = 0;
+                    const auto payload = reg.get_chunk_payload(bsvx::SectionType::VOXELS, map.local_chunk_x, map.local_chunk_y, map.local_chunk_z, &codec);
+                    if (!payload || bsvx::bvx::codec_describes_only_occupied(static_cast<bsvx::VoxelCodec>(codec))) sparse_covered += per_chunk;
+                }
+                prezeroed = (sparse_covered * 2 >= required);
+            }
+
+            if (linear && prezeroed) {
+                std::fill_n(out_voxels, required, 0u);
+            }
+            else if (linear) {
+                std::vector<bool> occupied(static_cast<size_t>(g.region_size_x) * g.region_size_y * g.region_size_z, false);
+                for (const auto& map : reg.chunk_map) {
+                    if (map.local_chunk_x >= g.region_size_x || map.local_chunk_y >= g.region_size_y || map.local_chunk_z >= g.region_size_z) continue;
+                    occupied[map.local_chunk_x + g.region_size_x * (static_cast<size_t>(map.local_chunk_y) + g.region_size_y * map.local_chunk_z)] = true;
+                }
+
+                for (uint16_t cz = 0; cz < g.region_size_z; ++cz) {
+                    for (uint16_t cy = 0; cy < g.region_size_y; ++cy) {
+                        for (uint16_t cx = 0; cx < g.region_size_x; ++cx) {
+                            if (occupied[cx + g.region_size_x * (static_cast<size_t>(cy) + g.region_size_y * cz)]) continue;
+                            for (uint16_t z = 0; z < g.chunk_size_z; ++z) {
+                                for (uint16_t y = 0; y < g.chunk_size_y; ++y) {
+                                    const size_t wx = static_cast<size_t>(cx) * g.chunk_size_x;
+                                    const size_t wy = static_cast<size_t>(cy) * g.chunk_size_y + y;
+                                    const size_t wz = static_cast<size_t>(cz) * g.chunk_size_z + z;
+                                    const size_t dst = wx + span_x * (wy + span_y * wz);
+                                    if (dst + g.chunk_size_x > required) continue;
+                                    std::fill_n(out_voxels + dst, g.chunk_size_x, 0u);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             for (size_t i = 0; i < reg.chunk_map.size(); ++i) {
                 if (ctx && ctx->progress && !ctx->progress(ctx->progress_user, "chunks", i, reg.chunk_map.size())) throw bsvx::CancelledError{};
 
                 const auto& map = reg.chunk_map[i];
-                const auto dense = reg.decode_chunk_voxels(map.local_chunk_x, map.local_chunk_y, map.local_chunk_z, &g);
-                if (dense.size() != per_chunk) return BSVX_RESULT_RUNTIME_ERROR;
 
-                if (layout == BSVX_LAYOUT_CHUNK_ORDER) {
-                    std::copy(dense.begin(), dense.end(), out_voxels + i * per_chunk);
-                    continue;
+                bsvx::bvx::VoxelDest dest;
+                dest.sx = g.chunk_size_x;
+                dest.sy = g.chunk_size_y;
+                dest.sz = g.chunk_size_z;
+                dest.already_air = prezeroed;
+
+                if (!linear) {
+                    dest.base = out_voxels + i * per_chunk;
+                    dest.row_stride = g.chunk_size_x;
+                    dest.plane_stride = static_cast<size_t>(g.chunk_size_x) * g.chunk_size_y;
+                }
+                else {
+                    // A chunk sitting outside the declared region bounds has nowhere to land.
+                    // Skipping it leaves its slot air, which the clearing pass above already wrote.
+                    if (map.local_chunk_x >= g.region_size_x || map.local_chunk_y >= g.region_size_y || map.local_chunk_z >= g.region_size_z) continue;
+
+                    const size_t wx = static_cast<size_t>(map.local_chunk_x) * g.chunk_size_x;
+                    const size_t wy = static_cast<size_t>(map.local_chunk_y) * g.chunk_size_y;
+                    const size_t wz = static_cast<size_t>(map.local_chunk_z) * g.chunk_size_z;
+
+                    dest.base = out_voxels + wx + span_x * (wy + span_y * wz);
+                    dest.row_stride = span_x;
+                    dest.plane_stride = span_x * span_y;
                 }
 
-                // Scatter the chunk into its slice of the region-wide array.
-                for (uint16_t z = 0; z < g.chunk_size_z; ++z) {
-                    for (uint16_t y = 0; y < g.chunk_size_y; ++y) {
-                        const size_t wx = static_cast<size_t>(map.local_chunk_x) * g.chunk_size_x;
-                        const size_t wy = static_cast<size_t>(map.local_chunk_y) * g.chunk_size_y + y;
-                        const size_t wz = static_cast<size_t>(map.local_chunk_z) * g.chunk_size_z + z;
-                        if (wy >= span_y) continue;
-
-                        const size_t dst = wx + span_x * (wy + span_y * wz);
-                        const size_t src = static_cast<size_t>(g.chunk_size_x) * (y + static_cast<size_t>(g.chunk_size_y) * z);
-                        if (dst + g.chunk_size_x > required) continue;
-                        std::copy_n(dense.begin() + static_cast<ptrdiff_t>(src), g.chunk_size_x, out_voxels + dst);
-                    }
-                }
+                reg.decode_chunk_voxels_into(map.local_chunk_x, map.local_chunk_y, map.local_chunk_z, dest, &g);
             }
             return BSVX_RESULT_OK;
         }

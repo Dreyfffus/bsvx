@@ -1,4 +1,5 @@
 #include "codec.h"
+#include <algorithm>
 #include <unordered_map>
 
 namespace bsvx::bvx {
@@ -50,9 +51,8 @@ namespace bsvx::bvx {
 		}
 	}
 
-	std::vector<uint32_t> unpack_indices_lsb(std::span<const std::byte> bytes, size_t count, uint8_t bits)
+	void unpack_indices_lsb_into(std::span<const std::byte> bytes, std::span<uint32_t> out, uint8_t bits)
 	{
-		std::vector<uint32_t> out(count, 0u);
 		if (bits == 0 || bits > 32) throw std::runtime_error("[bvx]: invalid bit width");
 
 		uint64_t scratch = 0u;
@@ -60,7 +60,7 @@ namespace bsvx::bvx {
 		size_t byte_cursor = 0;
 		const uint64_t mask = (bits == 32) ? ~0ull : ((1ull << bits) - 1ull);
 
-		for (size_t i = 0; i < count; i++) {
+		for (size_t i = 0; i < out.size(); i++) {
 			while (scratch_bits < bits) {
 				if (byte_cursor >= bytes.size()) throw std::runtime_error("[bvx]: bitpacked payload truncated");
 				scratch |= static_cast<uint64_t>(static_cast<uint8_t>(bytes[byte_cursor++])) << scratch_bits;
@@ -71,7 +71,12 @@ namespace bsvx::bvx {
 			scratch >>= bits;
 			scratch_bits -= bits;
 		}
+	}
 
+	std::vector<uint32_t> unpack_indices_lsb(std::span<const std::byte> bytes, size_t count, uint8_t bits)
+	{
+		std::vector<uint32_t> out(count, 0u);
+		unpack_indices_lsb_into(bytes, out, bits);
 		return out;
 	}
 
@@ -179,46 +184,238 @@ namespace bsvx::bvx {
 		return out;
 	}
 
-	std::vector<uint32_t> decode_voxels_empty(size_t count)
-	{
-		return std::vector<uint32_t>(count, 0u);
+	// --- decode into a destination view ----------------------------------------------------------
+	//
+	// These are the real implementations. Everything below them -- the contiguous-span forms and the
+	// vector-returning forms -- funnels into these, so each codec is decoded in exactly one place.
+	//
+	// Each is responsible for every voxel of `dest`, including the air its codec does not mention,
+	// except when dest.already_air says the caller has guaranteed the destination is clear.
+
+	namespace {
+
+		// Sequential LSB-first bit reader. Pulled out of unpack_indices_lsb so the palette codec can
+		// walk one row of the destination at a time while the bit stream keeps running across rows.
+		class LsbBitReader final {
+		public:
+			LsbBitReader(std::span<const std::byte> bytes, uint8_t bits)
+				: bytes_(bytes), bits_(bits), mask_((bits == 32) ? ~0ull : ((1ull << bits) - 1ull))
+			{
+				if (bits == 0 || bits > 32) throw std::runtime_error("[bvx]: invalid bit width");
+			}
+
+			uint32_t next()
+			{
+				while (scratch_bits_ < bits_) {
+					if (cursor_ >= bytes_.size()) throw std::runtime_error("[bvx]: bitpacked payload truncated");
+					scratch_ |= static_cast<uint64_t>(static_cast<uint8_t>(bytes_[cursor_++])) << scratch_bits_;
+					scratch_bits_ += 8;
+				}
+				const uint32_t value = static_cast<uint32_t>(scratch_ & mask_);
+				scratch_ >>= bits_;
+				scratch_bits_ -= bits_;
+				return value;
+			}
+
+		private:
+			std::span<const std::byte> bytes_;
+			uint64_t scratch_ = 0;
+			uint32_t scratch_bits_ = 0;
+			size_t cursor_ = 0;
+			uint8_t bits_;
+			uint64_t mask_;
+		};
+
+		void fill_dest(const VoxelDest& dest, uint32_t value)
+		{
+			for (uint16_t z = 0; z < dest.sz; ++z) {
+				for (uint16_t y = 0; y < dest.sy; ++y) {
+					uint32_t* row = dest.row(y, z);
+					std::fill(row, row + dest.sx, value);
+				}
+			}
+		}
+
+		void clear_unless_air(const VoxelDest& dest)
+		{
+			if (!dest.already_air) fill_dest(dest, 0u);
+		}
+
 	}
 
-	std::vector<uint32_t> decode_voxels_uniform(std::span<const std::byte> payload, size_t count)
+	bool codec_describes_only_occupied(VoxelCodec codec)
+	{
+		switch (codec) {
+		case VoxelCodec::CHUNK_EMPTY:
+		case VoxelCodec::SPARSE_LIST:
+		case VoxelCodec::Y_COLUMN_INTERVALS:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	VoxelDest contiguous_dest(std::span<uint32_t> out, uint16_t sx, uint16_t sy, uint16_t sz)
+	{
+		const size_t expected = static_cast<size_t>(sx) * sy * sz;
+		if (out.size() != expected) throw std::runtime_error("[bvx]: decode buffer is the wrong size");
+
+		VoxelDest dest;
+		dest.base = out.data();
+		dest.sx = sx; dest.sy = sy; dest.sz = sz;
+		dest.row_stride = sx;
+		dest.plane_stride = static_cast<size_t>(sx) * sy;
+		return dest;
+	}
+
+	void decode_voxel_payload_into(VoxelCodec codec, std::span<const std::byte> payload, const VoxelDest& dest)
 	{
 		size_t cursor = 0;
-		const uint32_t v = read_pod<uint32_t>(payload, cursor);
-		return std::vector<uint32_t>(count, v);
+
+		switch (codec) {
+
+		case VoxelCodec::CHUNK_EMPTY: {
+			clear_unless_air(dest);
+			return;
+		}
+
+		case VoxelCodec::CHUNK_UNIFORM: {
+			// Always written, air or not: a uniform chunk of key 0 is still every voxel.
+			fill_dest(dest, read_pod<uint32_t>(payload, cursor));
+			return;
+		}
+
+		case VoxelCodec::RAW_DENSE: {
+			if (payload.size() != dest.voxel_count() * sizeof(uint32_t)) {
+				throw std::runtime_error("[bvx]: raw dense payload has wrong size");
+			}
+			const auto* src = reinterpret_cast<const uint32_t*>(payload.data());
+			for (uint16_t z = 0; z < dest.sz; ++z) {
+				for (uint16_t y = 0; y < dest.sy; ++y) {
+					std::memcpy(dest.row(y, z), src, static_cast<size_t>(dest.sx) * sizeof(uint32_t));
+					src += dest.sx;
+				}
+			}
+			return;
+		}
+
+		case VoxelCodec::SPARSE_LIST: {
+			const uint32_t count = read_pod<uint32_t>(payload, cursor);
+			clear_unless_air(dest);
+			const size_t voxel_count = dest.voxel_count();
+
+			for (uint32_t i = 0; i < count; ++i) {
+				const uint32_t idx = read_pod<uint32_t>(payload, cursor);
+				const uint32_t key = read_pod<uint32_t>(payload, cursor);
+				if (idx >= voxel_count) throw std::runtime_error("[bvx]: sparse list index out of range");
+				*dest.at_linear(idx) = key;
+			}
+			return;
+		}
+
+		case VoxelCodec::PALLETE_BITPACK: {
+			const uint16_t palette_count = read_pod<uint16_t>(payload, cursor);
+			const uint8_t bits = read_pod<uint8_t>(payload, cursor);
+			(void)read_pod<uint8_t>(payload, cursor);
+
+			std::vector<uint32_t> palette(palette_count);
+			for (uint16_t i = 0; i < palette_count; ++i) palette[i] = read_pod<uint32_t>(payload, cursor);
+
+			// One pass: unpack an index and resolve it through the palette straight into place. The
+			// old path materialised a whole second index array first, which for a 16^3 chunk is
+			// another 16 KB allocated, written and read for nothing.
+			LsbBitReader reader(payload.subspan(cursor), bits);
+			for (uint16_t z = 0; z < dest.sz; ++z) {
+				for (uint16_t y = 0; y < dest.sy; ++y) {
+					uint32_t* row = dest.row(y, z);
+					for (uint16_t x = 0; x < dest.sx; ++x) {
+						const uint32_t index = reader.next();
+						if (index >= palette.size()) throw std::runtime_error("[bvx]: palette index out of range");
+						row[x] = palette[index];
+					}
+				}
+			}
+			return;
+		}
+
+		case VoxelCodec::Y_COLUMN_INTERVALS: {
+			clear_unless_air(dest);
+			const uint32_t column_count = read_pod<uint32_t>(payload, cursor);
+
+			for (uint32_t c = 0; c < column_count; ++c) {
+				const uint16_t x = read_pod<uint16_t>(payload, cursor);
+				const uint16_t z = read_pod<uint16_t>(payload, cursor);
+				const uint16_t run_count = read_pod<uint16_t>(payload, cursor);
+
+				if (x >= dest.sx || z >= dest.sz) {
+					throw std::runtime_error("[bvx]: y-column column coordinate out of range");
+				}
+
+				for (uint16_t r = 0; r < run_count; ++r) {
+					const uint16_t y_start = read_pod<uint16_t>(payload, cursor);
+					const uint16_t y_length = read_pod<uint16_t>(payload, cursor);
+					const uint32_t key = read_pod<uint32_t>(payload, cursor);
+
+					if (y_start + y_length > dest.sy) {
+						throw std::runtime_error("[bvx]: y-column run out of range");
+					}
+
+					// A run walks y, so it steps by one row in the destination.
+					uint32_t* cell = dest.at(x, y_start, z);
+					for (uint16_t n = 0; n < y_length; ++n, cell += dest.row_stride) *cell = key;
+				}
+			}
+			return;
+		}
+
+		default: throw std::runtime_error("[bvx]: unsupported voxel codec");
+
+		}
 	}
 
-	std::vector<uint32_t> decode_voxels_raw_dense(std::span<const std::byte> payload, size_t count)
+	// --- contiguous-buffer forms -----------------------------------------------------------------
+
+	void decode_voxel_payload_into(VoxelCodec codec, std::span<const std::byte> payload, uint16_t sx, uint16_t sy, uint16_t sz, std::span<uint32_t> out)
 	{
-		if (payload.size() != count * sizeof(uint32_t)) {
+		decode_voxel_payload_into(codec, payload, contiguous_dest(out, sx, sy, sz));
+	}
+
+	void decode_voxels_empty_into(std::span<uint32_t> out)
+	{
+		std::fill(out.begin(), out.end(), 0u);
+	}
+
+	void decode_voxels_uniform_into(std::span<const std::byte> payload, std::span<uint32_t> out)
+	{
+		size_t cursor = 0;
+		std::fill(out.begin(), out.end(), read_pod<uint32_t>(payload, cursor));
+	}
+
+	void decode_voxels_raw_dense_into(std::span<const std::byte> payload, std::span<uint32_t> out)
+	{
+		if (payload.size() != out.size() * sizeof(uint32_t)) {
 			throw std::runtime_error("[bvx]: raw dense payload has wrong size");
 		}
-		std::vector<uint32_t> out(count);
 		std::memcpy(out.data(), payload.data(), payload.size());
-		return out;
 	}
 
-	std::vector<uint32_t> decode_voxels_sparse_list(std::span<const std::byte> payload, size_t voxel_count)
+	// Kept separate from the VoxelDest path only because this signature carries a voxel count
+	// rather than chunk dimensions, and a linear index needs the dimensions to be decomposed.
+	void decode_voxels_sparse_list_into(std::span<const std::byte> payload, std::span<uint32_t> out)
 	{
 		size_t cursor = 0;
 		const uint32_t count = read_pod<uint32_t>(payload, cursor);
-		std::vector<uint32_t> out(voxel_count, 0u);
+		std::fill(out.begin(), out.end(), 0u);
 
 		for (uint32_t i = 0; i < count; ++i) {
 			const uint32_t idx = read_pod<uint32_t>(payload, cursor);
 			const uint32_t key = read_pod<uint32_t>(payload, cursor);
-			if (idx >= voxel_count) {
-				throw std::runtime_error("[bvx]: sparse list index out of range");
-			}
+			if (idx >= out.size()) throw std::runtime_error("[bvx]: sparse list index out of range");
 			out[idx] = key;
 		}
-		return out;
 	}
 
-	std::vector<uint32_t> decode_voxels_palette_bitpack(std::span<const std::byte> payload, size_t count)
+	void decode_voxels_palette_bitpack_into(std::span<const std::byte> payload, std::span<uint32_t> out)
 	{
 		size_t cursor = 0;
 		const uint16_t palette_count = read_pod<uint16_t>(payload, cursor);
@@ -226,73 +423,70 @@ namespace bsvx::bvx {
 		(void)read_pod<uint8_t>(payload, cursor);
 
 		std::vector<uint32_t> palette(palette_count);
-		for (uint16_t i = 0; i < palette_count; ++i) {
-			palette[i] = read_pod<uint32_t>(payload, cursor);
-		}
+		for (uint16_t i = 0; i < palette_count; ++i) palette[i] = read_pod<uint32_t>(payload, cursor);
 
-		const auto packed = payload.subspan(cursor);
-		std::vector<uint32_t> indices = unpack_indices_lsb(packed, count, bits);
-		std::vector<uint32_t> out(count, 0u);
-
-		for (size_t i = 0; i < count; ++i) {
-			if (indices[i] >= palette.size()) {
-				throw std::runtime_error("[bvx]: palette index out of range");
-			}
-			out[i] = palette[indices[i]];
+		LsbBitReader reader(payload.subspan(cursor), bits);
+		for (uint32_t& value : out) {
+			const uint32_t index = reader.next();
+			if (index >= palette.size()) throw std::runtime_error("[bvx]: palette index out of range");
+			value = palette[index];
 		}
+	}
+
+	void decode_voxels_y_column_intervals_into(std::span<const std::byte> payload, uint16_t sx, uint16_t sy, uint16_t sz, std::span<uint32_t> out)
+	{
+		decode_voxel_payload_into(VoxelCodec::Y_COLUMN_INTERVALS, payload, contiguous_dest(out, sx, sy, sz));
+	}
+
+	// --- returning forms, for callers that want to own the buffer --------------------------------
+
+	std::vector<uint32_t> decode_voxels_empty(size_t count)
+	{
+		return std::vector<uint32_t>(count, 0u);
+	}
+
+	std::vector<uint32_t> decode_voxels_uniform(std::span<const std::byte> payload, size_t count)
+	{
+		std::vector<uint32_t> out(count);
+		decode_voxels_uniform_into(payload, out);
+		return out;
+	}
+
+	std::vector<uint32_t> decode_voxels_raw_dense(std::span<const std::byte> payload, size_t count)
+	{
+		std::vector<uint32_t> out(count);
+		decode_voxels_raw_dense_into(payload, out);
+		return out;
+	}
+
+	std::vector<uint32_t> decode_voxels_sparse_list(std::span<const std::byte> payload, size_t voxel_count)
+	{
+		std::vector<uint32_t> out(voxel_count);
+		decode_voxels_sparse_list_into(payload, out);
+		return out;
+	}
+
+	std::vector<uint32_t> decode_voxels_palette_bitpack(std::span<const std::byte> payload, size_t count)
+	{
+		std::vector<uint32_t> out(count);
+		decode_voxels_palette_bitpack_into(payload, out);
 		return out;
 	}
 
 	std::vector<uint32_t> decode_voxels_y_column_intervals(std::span<const std::byte> payload, uint16_t sx, uint16_t sy, uint16_t sz)
 	{
-		const size_t voxel_count = static_cast<size_t>(sx) * sy * sz;
-		std::vector<uint32_t> out(voxel_count, 0u);
-
-		size_t cursor = 0;
-		const uint32_t column_count = read_pod<uint32_t>(payload, cursor);
-
-		for (uint32_t c = 0; c < column_count; ++c) {
-			const uint16_t x = read_pod<uint16_t>(payload, cursor);
-			const uint16_t z = read_pod<uint16_t>(payload, cursor);
-			const uint16_t run_count = read_pod<uint16_t>(payload, cursor);
-
-			if (x >= sx || z >= sz) {
-				throw std::runtime_error("[bvx]: y-column column coordinate out of range");
-			}
-
-			for (uint16_t r = 0; r < run_count; ++r) {
-				const uint16_t y_start = read_pod<uint16_t>(payload, cursor);
-				const uint16_t y_length = read_pod<uint16_t>(payload, cursor);
-				const uint32_t key = read_pod<uint32_t>(payload, cursor);
-
-				if (y_start + y_length > sy) {
-					throw std::runtime_error("[bvx]: y-column run out of range");
-				}
-
-				for (uint16_t y = y_start; y < static_cast<uint16_t>(y_start + y_length); ++y) {
-					out[linear_index(x, y, z, sx, sy, sz)] = key;
-				}
-			}
-		}
-
+		std::vector<uint32_t> out(static_cast<size_t>(sx) * sy * sz);
+		decode_voxels_y_column_intervals_into(payload, sx, sy, sz, out);
 		return out;
 	}
 
 	std::vector<uint32_t> decode_voxel_payload(VoxelCodec codec, std::span<const std::byte> payload, uint16_t sx, uint16_t sy, uint16_t sz)
 	{
-		const size_t voxel_count = static_cast<size_t>(sx) * sy * sz;
-		switch (codec) {
-		
-		case VoxelCodec::CHUNK_EMPTY:			return decode_voxels_empty(voxel_count);
-		case VoxelCodec::CHUNK_UNIFORM:			return decode_voxels_uniform(payload, voxel_count);
-		case VoxelCodec::PALLETE_BITPACK:		return decode_voxels_palette_bitpack(payload, voxel_count);
-		case VoxelCodec::SPARSE_LIST:			return decode_voxels_sparse_list(payload, voxel_count);
-		case VoxelCodec::Y_COLUMN_INTERVALS:	return decode_voxels_y_column_intervals(payload, sx, sy, sz);
-		case VoxelCodec::RAW_DENSE:				return decode_voxels_raw_dense(payload, voxel_count);
-		default: throw std::runtime_error("[bvx]: unsupported voxel codec");
-
-		}
+		std::vector<uint32_t> out(static_cast<size_t>(sx) * sy * sz);
+		decode_voxel_payload_into(codec, payload, sx, sy, sz, out);
+		return out;
 	}
+
 	EncodedVoxelPayload choose_best_voxel(std::span<const uint32_t> dense, uint16_t sx, uint16_t sy, uint16_t sz)
 	{
 		EncodedVoxelPayload best{};
