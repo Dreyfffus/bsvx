@@ -2,6 +2,7 @@
 #include "definitions.h"
 #include "util.h"
 #include "bvx_header.h"
+#include "codec.h"
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -64,6 +65,12 @@ namespace bsvx::bvx {
 		// Returns a view into the section blob; it is invalidated by any mutation of this archive.
 		std::optional<std::span<const std::byte>> get_chunk_payload(SectionType type, uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, uint16_t* out_codec = nullptr, uint16_t* out_entry_flags = nullptr) const;
 		std::vector<uint32_t> decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const GeometryDesc* geometry_override = nullptr) const;
+		// The same decode without the allocation: `out` must be exactly chunk_voxel_count() long and
+		// is fully defined on return, air included.
+		void decode_chunk_voxels_into(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, std::span<uint32_t> out, const GeometryDesc* geometry_override = nullptr) const;
+		// And the same again into a strided slice of a larger array, which is how a whole region is
+		// decoded into one dense buffer without staging every chunk through a scratch copy.
+		void decode_chunk_voxels_into(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const VoxelDest& dest, const GeometryDesc* geometry_override = nullptr) const;
 
 		// Content identity of a chunk: FNV-1a over the *decoded* voxels, so re-encoding the same
 		// voxels under a different codec does not change it. That is what lets a host tell which
@@ -178,6 +185,9 @@ namespace bsvx::bvx {
 		// Fetches exactly the bytes of one chunk's payload from the source.
 		std::optional<std::vector<std::byte>> read_chunk_payload(SectionType type, uint32_t chunk_index, uint16_t* out_codec = nullptr, uint16_t* out_entry_flags = nullptr) const;
 		std::vector<uint32_t> decode_chunk_voxels(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z) const;
+		// See Archive::decode_chunk_voxels_into.
+		void decode_chunk_voxels_into(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, std::span<uint32_t> out) const;
+		void decode_chunk_voxels_into(uint16_t chunk_x, uint16_t chunk_y, uint16_t chunk_z, const VoxelDest& dest) const;
 
 		// Reads the whole file and checks the header hash. Not done at open() -- the point of this
 		// class is to avoid touching every byte.

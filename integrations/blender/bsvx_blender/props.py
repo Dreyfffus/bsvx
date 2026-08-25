@@ -91,16 +91,16 @@ class BsvxSceneSettings(bpy.types.PropertyGroup):
 
     active_key: bpy.props.IntProperty(
         name="Active Key",
-        description="The voxel key authoring operators write",
+        description="The voxel key authoring operators write when the mesh does not say otherwise",
         min=1,
         default=1,
     )
 
-    vertex_budget: bpy.props.IntProperty(
-        name="Vertex Budget",
+    voxel_budget: bpy.props.IntProperty(
+        name="Voxel Budget",
         description=(
-            "Refuse to check out more voxels than this. A 512-cubed world is 134 million voxels; "
-            "materializing one is not an operation Blender survives"
+            "Refuse to build a mesh from more voxels than this. A 512-cubed world is 134 million "
+            "voxels; materializing one is not an operation Blender survives"
         ),
         min=1,
         default=2_000_000,

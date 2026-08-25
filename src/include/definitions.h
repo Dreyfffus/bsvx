@@ -120,6 +120,7 @@ namespace bsvx {
 		SPARSE_LIST				= 4,
 		Y_COLUMN_INTERVALS		= 5,
 		RAW_DENSE				= 6,
+		SPARSE_PACKED			= 7,
 		AUTO					= 0xFFFFu
 	};
 

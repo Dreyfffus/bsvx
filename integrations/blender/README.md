@@ -1,61 +1,83 @@
 # bsvx for Blender
 
-A Blender 4.2+ add-on that opens, authors, modifies and writes `.bsvx` worlds and standalone `.bvx`
+A Blender 4.2+ add-on that **authors, exports and writes** `.bsvx` worlds and standalone `.bvx`
 regions, through the ctypes binding in `python/bsvx`.
+
+It is deliberately not a voxel editor. Blender already has several good ones —
+[Vox Cleaner](https://github.com/TheStrokeForge/Vox-Cleaner-V3), Vox Tools, the MagicaVoxel
+importers, and Blender's own mesh tools — and a format add-on that grew its own would be a worse
+version of all of them. What it does instead is put BSVX worlds into the shape those tools already
+speak, and take them back afterwards.
 
 ## What a voxel is in Blender
 
-This is the question the whole design turns on, so it is answered first and answered once.
+**A voxel is a cube in a mesh.** One material per voxel key, interior faces culled, corners welded.
 
-Blender has **no datablock that is a `uint32` voxel grid**. Volume objects are OpenVDB float grids
-and are effectively read-only from Python; meshes are surfaces; geometry attributes are the only
-general-purpose per-element storage. So a representation has to be chosen, and it has to be one
-that Blender's own editing tools operate on — otherwise "modify" means "type numbers into a panel",
-which is not why anyone opens Blender.
-
-**A voxel is a vertex.**
+That is not the cheapest encoding. A vertex per voxel would be a quarter of the data and a
+bijection with the cell, and an earlier version of this add-on did exactly that. It is the wrong
+choice anyway, because it is a representation only this add-on understands. Vox Cleaner imports,
+decimates, UV-unwraps and bakes a cube mesh with one material per palette entry; the MagicaVoxel
+importers it is built on produce exactly that; every modifier, boolean and select tool in Blender
+operates on it. Matching that convention is the difference between a world those tools can work on
+and a point cloud they refuse.
 
 | | |
 | --- | --- |
-| Position | the voxel cell's **centre**, in Blender-space metres |
-| Key | integer attribute `bsvx_key` on the POINT domain |
-| Colour | byte-colour attribute `bsvx_color` on POINT — *display only*, rebuilt from the registry on every checkout |
+| Geometry | one axis-aligned cube per non-air voxel, interior faces culled, lattice corners shared |
+| Key | integer attribute `bsvx_key` on the **FACE** domain — authoritative |
+| Materials | one slot per key, named `bsvx_<key>_<name>`, base colour from the registry, stamped with a `bsvx_key` custom property |
+| Colour | `bsvx_color`, byte colour on the CORNER domain, and the mesh's active colour attribute |
 
-Everything follows from that. Box-select, move (with grid snap), delete, duplicate, mask, and
-Geometry Nodes all work on vertices, so they all work on voxels. Instancing a cube on each point
-gives you the blocky preview without the data ever being cubes.
+The key is stamped on the material rather than parsed out of its name, because Blender renames on
+collision and users rename on purpose. A mesh that has lost the stamp still falls back to slot
+index + 1 — the convention every `.vox` importer follows — so a freshly imported MagicaVoxel model
+exports to BSVX with no setup at all.
 
-The obvious alternative — eight vertices and six faces per voxel — was rejected on both counts that
-matter. It is twenty-four times the data for the same information, and it is *ambiguous on
-read-back*: once a user has merged, extruded or dissolved anything, no rule recovers "which voxels
-did they mean". A vertex is a bijection with a cell, and flooring its position is the entire inverse.
+## The round trip, and what survives it
 
-### Consequences worth knowing
+**Import From Mesh** does not assume a face is a voxel. It rasterizes every axis-aligned face into
+the cells its rectangle covers, so coplanar merging — greedy meshing on the way in, Decimate on the
+way out — changes nothing. Six big quads rebuild a solid box exactly as well as 216 small ones.
 
-- **A vertex anywhere inside a cell counts as that cell.** You do not have to land exactly on the
-  centre; the commit floors. Two vertices in one cell is a collision — the last one wins and the
-  operator reports how many.
-- **The object transform is honoured.** Moving, rotating or scaling the whole object moves the
-  voxels, because that is the only reading of "I moved it" that does not silently discard the edit.
-- **Air is not a vertex.** A cell with no vertex is air. That is what makes deletion work.
+It also reconstructs the **interior**. A culled shell has lost its inside, and a naive read would
+give back a hollow world: silent loss, the kind that surfaces three exports later. It is recovered
+by parity along one axis — a cell owning a face that points down the axis opens a solid run, the
+next cell owning a face that points up it closes one. For a closed model that is exact, and it
+costs O(faces) where a flood fill would cost O(volume).
+
+So these round-trip losslessly:
+
+- deleting geometry (a voxel with no faces left is air — this is what makes deletion mean something)
+- moving, rotating by right angles, or scaling the whole object
+- booleans against grid-aligned cutters
+- greedy/coplanar merging, limited dissolve, Decimate's planar mode
+- anything Vox Tools does that leaves the model on the grid
+
+And these do **not**, by their own design:
+
+- **Vox Cleaner's clean is a terminal step.** Once it has decimated to a marching-cubes-ish surface
+  and baked colour into a texture, the result is a game-ready mesh, not a voxel model. That is the
+  point of it. Export to it, not back through it.
+- anything that leaves the grid — sculpting, subdivision, non-right-angle rotation. Those still
+  import, but through the ray-parity voxelizer rather than cell for cell, and the operator says so.
+
+`Fill Interior` reports how many faces failed to pair; that count is how an open or self-
+intersecting model announces itself, rather than quietly filling to infinity.
 
 ## The working set, and why it is not the whole world
 
-A 512³ world is 134 million voxels. Blender does not survive materializing that, and neither does
-the session. So the world itself lives as a C handle owned by the add-on, and Blender geometry is a
-**checked-out working set**: a bounded box of voxels, materialized for editing.
+A 512³ world is 134 million voxels. Blender does not survive materializing that, so **Export To
+Mesh** takes the whole world, one region, or an explicit cell box, and refuses to exceed a voxel
+budget (default 2 million, in the panel).
 
-The object records the box it owns (`bsvx_bounds_min` / `bsvx_bounds_max` custom properties), and
-**committing replaces that box**. That is precisely what gives deletion meaning — a vertex the user
-removed leaves no trace in the mesh, so only "everything in this box is what the mesh now says"
-reproduces their intent. Voxels dragged *outside* the box are still written, and counted separately
-in the report, because dropping them would silently undo a deliberate move.
+The object records the box it came from (`bsvx_bounds_min` / `bsvx_bounds_max`), and importing
+**replaces that box** by default. That is what gives deletion meaning: a voxel the user removed
+leaves no trace in the mesh, so only "everything in this box is what the mesh now says" reproduces
+their intent. Turn *Replace Bounds* off to merge instead.
 
-Checkout refuses to exceed a vertex budget (default 2 million, in the panel).
-
-The handle cannot be saved into a `.blend`. What the scene records is the world's *path*; after a
-reload the panel offers **Reopen**, and the file on disk is the source of truth. This is deliberate:
-a copy of the world inside Blender's data would be a second source of truth that drifts.
+The world handle cannot be saved into a `.blend`. What the scene records is the world's *path*;
+after a reload the panel offers **Reopen**, and the file on disk is the source of truth. A copy of
+the world inside Blender's data would be a second source of truth that drifts.
 
 ## Coordinates
 
@@ -65,11 +87,13 @@ than by hand-written offsets. A negated axis needs a one-cell shift (cell `c` co
 mirror is `-c-1`), and writing that by hand is the classic way to move a world by exactly one voxel:
 invisible on symmetric test content, obvious on the first real geometry.
 
-The add-on reads the world's declared convention and adapts, so a Z-up world authored here and a
-Y-up world authored for Godot both display correctly without either being silently rewritten.
+Cube winding is *measured* against that permutation rather than derived by hand, for the same
+reason: two of the three conventions flip handedness, and a mesh with inverted normals looks right
+until something renders it with backface culling.
 
-Voxel size and origin come from the file's `[units]`, so nothing has to be guessed on import or
-remembered on export.
+The add-on reads the world's declared convention and adapts, so a Z-up world authored here and a
+Y-up world authored for Godot both display correctly without either being silently rewritten. Voxel
+size and origin come from the file's `[units]`, so nothing has to be guessed on import.
 
 ## Installing
 
@@ -119,10 +143,14 @@ blender --factory-startup --background --python integrations/blender/tests/test_
 enables the installed copy, the script registers a second copy of the same classes over it, and
 the teardown of whichever one loses raises on exit.
 
-98 checks covering the axis mapping against the library's own `convert_cell`, the cell/point round
-trip, authoring and reopening a world from disk, checkout → edit in bmesh → commit (including that
-deleting a vertex deletes the voxel), object transforms, voxelization, dirty save, reopen after
-handle loss, validation, and standalone `.bvx` export. It exits non-zero on the first failure.
+148 checks. The axis mapping is checked against the library's own `convert_cell`; the cube is
+checked to cover exactly its cell under every convention; the mesh round trip is checked by
+comparing the region's decoded voxel array *before and after*, so a mesh that loses, shifts or
+hollows anything cannot pass. Also covered: face culling and outward normals, deleting faces
+deleting voxels, a solid body surviving as a hollow shell, six dissolved quads rebuilding it, a
+boolean cut, keys recovered from materials and from colours, auto-registering an unknown colour,
+object transforms, voxelizing an arbitrary mesh, dirty save and reopen, validation, and standalone
+`.bvx` export. It exits non-zero on the first failure.
 
 ## The workflow
 
@@ -131,22 +159,28 @@ handle loss, validation, and standalone `.bvx` export. It exits non-zero on the 
 1. *BSVX ▸ World*: set chunk size, region size and voxel size, then **New**.
 2. *Registry*: add entries, or **Registry From Materials** to take one key per material slot of the
    active object. Set colours. **Push** to write them into the world.
-3. *Authoring*: set the active key, then **Voxelize Object** on a mesh, or **Fill Box**.
+3. *Authoring*: **Fill Box** for blocks, or model a shape and **Import From Mesh** to voxelize it —
+   keys come from its materials, so a two-material mesh gives two voxel types.
 4. **Save As** to a directory.
 
-**Modify an existing world**
+**Bring in a MagicaVoxel model**
+
+1. Import the `.vox` with whichever add-on you already use.
+2. **New** a world with a matching voxel size.
+3. **Import From Mesh**. Keys come from the material slots; unknown colours get registry entries.
+4. **Save As**.
+
+**Edit an existing world**
 
 1. **Open** a world directory, its `manifest.toml`, or a `.bvx`.
-2. *Working Set*: **Check Out Everything**, a region, or an explicit box.
-3. Edit the point mesh with Blender's normal tools — delete vertices, move them, duplicate them,
-   change `bsvx_key` in the spreadsheet editor or through Geometry Nodes.
-4. **Commit Working Set**.
-5. **Save** (writes only what changed) or **Save As**.
+2. *Mesh*: **Export To Mesh** — the whole world, one region, or a box.
+3. Edit it with Vox Tools, Blender's mesh tools, booleans, whatever keeps it on the grid.
+4. **Import From Mesh**, then **Save** (writes only what changed) or **Save As**.
 
-**Export**
+**Ship it as an asset**
 
-**Save As** writes a full world directory. **Export .bvx** writes a single-region world as one
-standalone file, which is what a runtime that streams individual regions wants.
+**Export To Mesh**, then run Vox Cleaner on the result. That path ends there — the cleaned mesh is
+an asset, not a world.
 
 ## Operators
 
@@ -159,9 +193,8 @@ standalone file, which is what a runtime that streams individual regions wants.
 | `bsvx.save_world` | dirty-only write back to the source path |
 | `bsvx.save_world_as` | full write to a directory |
 | `bsvx.export_region` | single region as a standalone `.bvx` |
-| `bsvx.checkout_all` / `checkout_region` / `checkout_box` | materialize voxels as a point mesh |
-| `bsvx.commit` | write working sets back, replacing the boxes they own |
-| `bsvx.voxelize_object` | mesh volume → voxels, solid or surface-only |
+| `bsvx.to_mesh` | world, region or box → cube mesh with materials |
+| `bsvx.from_mesh` | mesh → voxels, cell for cell or by voxelization |
 | `bsvx.fill_box` | fill or erase a cell box directly |
 | `bsvx.registry_pull` / `registry_push` | move the registry between world and UI |
 | `bsvx.registry_add` / `registry_remove` / `registry_from_materials` | edit the registry list |
@@ -170,16 +203,23 @@ standalone file, which is what a runtime that streams individual regions wants.
 | `bsvx.compact` | reclaim dead bytes in each region |
 | `bsvx.remove_region` | drop a region |
 
+`bsvx.from_mesh` picks its mode from the mesh unless told: essentially-axis-aligned reads cell for
+cell, anything else voxelizes. Keys come from `bsvx_key`, then materials, then colours, then the
+active key — again unless told.
+
 ## Limits, stated plainly
 
+- **A merged face is read as its bounding rectangle.** That is exact for the rectangles coplanar
+  merging actually produces, and wrong for a concave n-gon — an L-shaped dissolved face fills the
+  notch. Limited Dissolve on a rectangular slab is fine; on an L-shaped one, keep the quads.
 - **Voxelization needs a closed mesh.** It is ray parity along Blender's +X, which makes the cost
   proportional to cross-section rather than volume — but an open surface has an unpaired crossing
-  and the fill leaks along that line. `Surface Only` sidesteps the question entirely.
-- **No preview meshing.** Points are drawn as points. Instancing a cube per point is a Geometry
-  Nodes modifier away and is a display choice, not the add-on's to make.
+  and the fill leaks along that line. `Surface Only` sidesteps the question.
+- **Colours are 8-bit sRGB in a colour attribute**, so key-from-colour matches by nearest rather
+  than by equality. The `bsvx_key` attribute is the lossless path and is preferred automatically.
 - **One world per scene.** Editing two at once multiplies every operator's "which world?" question
   and nothing in the format needs it.
 - **Keys above 2³¹** read back negative in the `bsvx_key` attribute, which is `int32`. The
   reinterpretation is bit-exact, so they round-trip correctly; they just look odd in the UI.
-- **No threading.** Everything runs on the main thread. A large checkout blocks Blender.
+- **No threading.** Everything runs on the main thread. A large export blocks Blender.
 - **`.btx` authoring is limited to `make_palette`.** Full texture archives are the library's API.

@@ -194,6 +194,7 @@ intended place for a Godot plugin to cache baked meshes/collision.
 | 4 | `SPARSE_LIST` | (index, key) pairs |
 | 5 | `Y_COLUMN_INTERVALS` | run-length along Y columns |
 | 6 | `RAW_DENSE` | dense u32 array |
+| 7 | `SPARSE_PACKED` | palette + bit-packed (index, palette index) pairs |
 | 0xFFFF | `AUTO` | on write: try all, keep the smallest (`choose_best_voxel`) |
 
 Pass `0xFFFF` (AUTO) when writing unless you have a reason not to. Decode is transparent — you always

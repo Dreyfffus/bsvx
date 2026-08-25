@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import bpy
 
-from . import binding, session, working_set
+from . import binding, session, voxel_mesh
 
 
 class BSVX_UL_registry(bpy.types.UIList):
@@ -88,9 +88,9 @@ class BSVX_PT_world(_Panel, bpy.types.Panel):
         row.operator("bsvx.close_world", text="Close", icon="X")
 
 
-class BSVX_PT_working_set(_Panel, bpy.types.Panel):
-    bl_label = "Working Set"
-    bl_idname = "BSVX_PT_working_set"
+class BSVX_PT_mesh(_Panel, bpy.types.Panel):
+    bl_label = "Mesh"
+    bl_idname = "BSVX_PT_mesh"
     bl_parent_id = "BSVX_PT_world"
 
     @classmethod
@@ -101,25 +101,26 @@ class BSVX_PT_working_set(_Panel, bpy.types.Panel):
         layout = self.layout
         settings = context.scene.bsvx
 
-        layout.label(text="A voxel is a vertex; its key is the bsvx_key attribute.")
+        layout.label(text="A voxel is a cube; its key is the bsvx_key face attribute.")
+        layout.label(text="Edit with Vox Cleaner, Vox Tools or plain Blender, then import back.")
 
         column = layout.column(align=True)
-        column.operator("bsvx.checkout_all", icon="IMPORT")
-        column.operator("bsvx.checkout_region", icon="MESH_GRID")
-        column.operator("bsvx.checkout_box", icon="MESH_CUBE")
-        layout.prop(settings, "vertex_budget")
+        column.operator("bsvx.to_mesh", icon="EXPORT").source = "WORLD"
+        row = column.row(align=True)
+        row.operator("bsvx.to_mesh", text="Region", icon="MESH_GRID").source = "REGION"
+        row.operator("bsvx.to_mesh", text="Box", icon="MESH_CUBE").source = "BOX"
+        layout.prop(settings, "voxel_budget")
 
         obj = context.active_object
-        if working_set.is_working_set(obj):
-            try:
-                lo, hi = working_set.bounds_of(obj)
+        if voxel_mesh.is_voxel_mesh(obj):
+            bounds = voxel_mesh.bounds_of(obj)
+            if bounds is not None:
+                lo, hi = bounds
                 box = layout.box()
                 box.label(text=f"owns [{lo[0]}, {lo[1]}, {lo[2]}] .. [{hi[0]}, {hi[1]}, {hi[2]}]")
-                box.label(text=f"{len(obj.data.vertices):,} voxel(s)")
-            except Exception:
-                pass
+                box.label(text=f"{len(obj.data.polygons):,} face(s)")
 
-        layout.operator("bsvx.commit", icon="EXPORT")
+        layout.operator("bsvx.from_mesh", icon="IMPORT")
 
 
 class BSVX_PT_authoring(_Panel, bpy.types.Panel):
@@ -134,7 +135,6 @@ class BSVX_PT_authoring(_Panel, bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         layout.prop(context.scene.bsvx, "active_key")
-        layout.operator("bsvx.voxelize_object", icon="MOD_REMESH")
         layout.operator("bsvx.fill_box", icon="CUBE")
 
 
@@ -204,7 +204,7 @@ CLASSES = (
     BSVX_UL_registry,
     BSVX_UL_issues,
     BSVX_PT_world,
-    BSVX_PT_working_set,
+    BSVX_PT_mesh,
     BSVX_PT_authoring,
     BSVX_PT_registry,
     BSVX_PT_validation,

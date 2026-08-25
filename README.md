@@ -181,10 +181,11 @@ plugin manifest; none of them extend the format.
   `Resource` that loads, authors and saves worlds. `godot-cpp` is its only submodule; bsvx is linked
   statically from this repository. It is the format layer only — no meshing, no baking, no
   generation — so several renderers can sit on top of the same worlds.
-- **[`integrations/blender/`](integrations/blender/)** — a Blender 4.2+ add-on for opening,
-  authoring, modifying and writing worlds, built on the ctypes binding. A voxel is a **vertex** with
-  a `bsvx_key` integer attribute, checked out from the world a bounded box at a time, so Blender's
-  own editing tools operate on voxels directly.
+- **[`integrations/blender/`](integrations/blender/)** — a Blender 4.2+ add-on that authors, exports
+  and writes worlds, built on the ctypes binding. A voxel is a **cube** with its key in a `bsvx_key`
+  FACE attribute and one material slot per key — the shape Vox Cleaner, Vox Tools and the
+  MagicaVoxel importers already speak, so editing stays with the tools that do it well. Importing
+  back reads merged coplanar faces cell for cell and rebuilds a culled shell's interior exactly.
 
 ---
 

@@ -34,7 +34,11 @@ def object_cell_bounds(obj, frame) -> tuple[np.ndarray, np.ndarray]:
 
 
 def voxelize(obj, frame, lo, hi, *, surface_only: bool = False, max_cells: int = 8_000_000):
-    """Returns the (N, 3) int64 BSVX cells of `obj` inside the inclusive cell box.
+    """Returns (cells (N, 3) int64, source polygon per cell (N,) int64) inside the inclusive box.
+
+    The polygon index is what lets a multi-material mesh voxelize into more than one key: the
+    caller maps polygon -> material slot -> voxel key. For a solid fill the polygon reported is the
+    one the ray *entered* through, which is the surface the run belongs to.
 
     `obj` must already be evaluated (apply modifiers with `obj.evaluated_get(depsgraph)` first) --
     this only reads its geometry.
@@ -45,7 +49,7 @@ def voxelize(obj, frame, lo, hi, *, surface_only: bool = False, max_cells: int =
     hi = np.asarray(hi, dtype=np.int64)
     counts = hi - lo + 1
     if np.any(counts <= 0):
-        return np.zeros((0, 3), dtype=np.int64)
+        return np.zeros((0, 3), dtype=np.int64), np.zeros((0,), dtype=np.int64)
 
     total = int(np.prod(counts))
     if total > max_cells:
@@ -76,6 +80,7 @@ def voxelize(obj, frame, lo, hi, *, surface_only: bool = False, max_cells: int =
 
     n0, n1, n2 = grids[0].shape
     selected: list[np.ndarray] = []
+    sources: list[np.ndarray] = []
 
     for i in range(n0):
         for j in range(n1):
@@ -85,9 +90,11 @@ def voxelize(obj, frame, lo, hi, *, surface_only: bool = False, max_cells: int =
             start_x = float(min(xs.min(), xs.max())) - 1.0
             origin_world = Vector((start_x, float(line[0, 1]), float(line[0, 2])))
 
-            crossings = _crossings(obj, matrix_inv @ origin_world, local_direction)
+            crossings, polygons = _crossings(obj, matrix_inv @ origin_world, local_direction)
             if not crossings:
                 continue
+
+            source = np.full(n2, -1, dtype=np.int64)
 
             if surface_only:
                 inside = np.zeros(n2, dtype=bool)
@@ -96,37 +103,42 @@ def voxelize(obj, frame, lo, hi, *, surface_only: bool = False, max_cells: int =
                 # Nearest cell centre to each hit, which is the cell the surface passes through.
                 hit_index = np.clip(np.searchsorted(sorted_xs, crossings), 0, n2 - 1)
                 inside[order[hit_index]] = True
+                source[order[hit_index]] = polygons
             else:
                 if len(crossings) % 2:
                     # An open surface: one crossing has no partner and everything past it would
                     # fill. Dropping the last one keeps the leak bounded instead of unbounded.
-                    crossings = crossings[:-1]
+                    crossings, polygons = crossings[:-1], polygons[:-1]
                 if not crossings:
                     continue
                 spans = np.asarray(crossings, dtype=np.float64).reshape(-1, 2)
+                entry = np.asarray(polygons, dtype=np.int64).reshape(-1, 2)[:, 0]
                 inside = np.zeros(n2, dtype=bool)
-                for start, end in spans:
-                    inside |= (xs >= start) & (xs <= end)
+                for (start, end), polygon in zip(spans, entry):
+                    span = (xs >= start) & (xs <= end)
+                    inside |= span
+                    source[span] = polygon
 
             if inside.any():
                 selected.append(cells[i, j][inside])
+                sources.append(source[inside])
 
     if not selected:
-        return np.zeros((0, 3), dtype=np.int64)
-    return np.concatenate(selected)
+        return np.zeros((0, 3), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+    return np.concatenate(selected), np.concatenate(sources)
 
 
-def _crossings(obj, local_origin, local_direction) -> list[float]:
-    """Every surface crossing along the ray, as world-space X, in increasing order."""
-    hits: list[float] = []
+def _crossings(obj, local_origin, local_direction):
+    """Every surface crossing along the ray: (world-space X, polygon index), sorted by X."""
+    hits: list[tuple[float, int]] = []
     origin = local_origin.copy()
 
     for _ in range(_MAX_CROSSINGS):
-        hit, location, _normal, _index = obj.ray_cast(origin, local_direction)
+        hit, location, _normal, index = obj.ray_cast(origin, local_direction)
         if not hit:
             break
-        hits.append(float((obj.matrix_world @ location).x))
+        hits.append((float((obj.matrix_world @ location).x), int(index)))
         origin = location + local_direction * _EPSILON
 
     hits.sort()
-    return hits
+    return [x for x, _ in hits], [p for _, p in hits]

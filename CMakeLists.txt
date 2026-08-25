@@ -119,6 +119,22 @@ if(BSVX_BUILD_TESTS)
     add_test(NAME bsvx_tests COMMAND bsvx_tests WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+# Off by default: it is a measurement tool, not part of the library or of what CI gates on, and it
+# writes multi-megabyte fixtures to disk when it runs.
+option(BSVX_BUILD_BENCH "Build the .vox comparison benchmark" OFF)
+if(BSVX_BUILD_BENCH)
+    add_executable(bench_vox "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_vox.cpp")
+    target_link_libraries(bench_vox PRIVATE bsvx)
+    # bvx_anatomy.hpp reads the on-disk structures through the library's own layout headers, which
+    # live in src/impl's include path alongside the public ones.
+    target_include_directories(bench_vox PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/bench"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/impl")
+    if(BSVX_BUILD_SHARED)
+        target_compile_definitions(bench_vox PRIVATE BSVX_ASSETS_USE_DLL)
+    endif()
+endif()
+
 # ------------------------------------------------------------------------------------------------
 # Install / package
 # ------------------------------------------------------------------------------------------------

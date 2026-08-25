@@ -116,6 +116,27 @@ class Frame:
         centre = (np.asarray(cell, dtype=np.float64) + 0.5).reshape(1, 3)
         return tuple(int(v) for v in np.floor(self.bsvx_to_blender(centre))[0])
 
+    def axis_map(self) -> tuple[tuple[int, float], ...]:
+        """(blender axis, sign) for each BSVX axis, under this world's convention.
+
+        Cube meshing needs the whole permutation, not just one axis of it: a face on BSVX +X is a
+        face on some Blender axis in some direction, and which one is exactly this table.
+        """
+        return self._permutation()
+
+    def corner_points(self, corners: np.ndarray) -> np.ndarray:
+        """(N, 3) integer cell *corners* -> (N, 3) Blender-space positions.
+
+        Corner ``k`` of the grid is the point where cells ``k-1`` and ``k`` meet on every axis, so
+        cell ``c`` spans corners ``c`` to ``c + 1``. Cube meshing is built out of these rather than
+        out of centres plus half-extents, because the corner lattice is shared: two neighbouring
+        voxels name the same corner by the same integer, which is what lets the mesh weld.
+        """
+        corners = np.asarray(corners, dtype=np.float64).reshape(-1, 3)
+        size = np.asarray(self.voxel_size, dtype=np.float64)
+        origin = np.asarray(self.origin, dtype=np.float64)
+        return self.bsvx_to_blender(origin + corners * size)
+
     def blender_x_axis(self) -> int:
         """The BSVX axis index that runs along Blender's +X under this convention.
 
