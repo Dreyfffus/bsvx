@@ -35,8 +35,10 @@ back into that same grid, so the timed work is identical on both sides.
 - **byte anatomy** — where a `.bvx`'s bytes go: header, chunk map, summary table, section and entry
   tables, voxel payload, and which codec each chunk chose. Read through the library's own layout
   headers, so it follows the format rather than duplicating it.
-- **the packed-sparse what-if** — what the payloads would come to if `SPARSE_LIST` bit-packed its
-  index and palette-indexed its key instead of spending a full `uint32` on each.
+- **the packed-sparse cross-check** — the same payloads priced from the source grid by a model of a
+  bit-packed sparse codec, written independently of the library. It sized the gap before
+  `SPARSE_PACKED` existed; now it should read ~0% saved, and a row that does not is a sign the
+  encoder and the model disagree about something.
 
 Both round-trips are verified against the source grid before anything is timed. A benchmark whose
 two sides disagree about the data is measuring nothing.

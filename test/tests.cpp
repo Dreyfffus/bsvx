@@ -1835,6 +1835,110 @@ namespace {
         }
     }
 
+    // SPARSE_PACKED is SPARSE_LIST with both of its fields cut to the width they need. The content
+    // it exists for is surface-like: a chunk that is mostly air, but whose occupied voxels are far
+    // too many to spend eight bytes each on.
+    void test_sparse_packed_codec()
+    {
+        Context ctx;
+        const bsvx_geometry_desc geometry{ 16, 16, 16, 1, 1, 1 };
+        const size_t per_chunk = 16u * 16u * 16u;
+
+        bsvx_world* raw = nullptr;
+        REQUIRE_EQ(bsvx_world_create(ctx.get(), &geometry, &raw), BSVX_RESULT_OK);
+        World world(raw);
+        for (uint32_t key = 1; key <= 8u; ++key) {
+            bsvx_registry_entry entry{ key, 0u, 1u, 0u };
+            REQUIRE_EQ(bsvx_world_set_registry_entry(world.get(), &entry), BSVX_RESULT_OK);
+        }
+        size_t region = 0;
+        REQUIRE_EQ(bsvx_world_add_region(world.get(), 0, 0, 0, &region), BSVX_RESULT_OK);
+
+        // A one-voxel-thick surface: exactly one y per (x, z), so 256 of 4096, over eight keys.
+        std::vector<uint32_t> surface(per_chunk, 0u);
+        size_t surface_non_air = 0;
+        for (uint32_t z = 0; z < 16u; ++z) {
+            for (uint32_t x = 0; x < 16u; ++x) {
+                const uint32_t y = (x + z) % 16u;
+                surface[x + 16u * (y + 16u * z)] = 1u + ((x * 7u + z) % 8u);
+                ++surface_non_air;
+            }
+        }
+        REQUIRE_EQ(surface_non_air, 256u);
+
+        // Store under one codec, check it is what came back, and check the decode is lossless.
+        const auto store_as = [&](const std::vector<uint32_t>& dense, uint16_t codec) {
+            REQUIRE_EQ(bsvx_region_set_chunk_u32_ex(ctx.get(), world.get(), region, 0, 0, 0,
+                dense.data(), dense.size(), codec), BSVX_RESULT_OK);
+
+            size_t size = 0;
+            uint16_t stored = 0;
+            REQUIRE_EQ(bsvx_region_get_chunk_payload_info(world.get(), region, 2u /*VOXELS*/,
+                0, 0, 0, &size, &stored, nullptr), BSVX_RESULT_OK);
+            if (codec != 0xFFFFu) REQUIRE_EQ(stored, codec);
+
+            // Poisoned: the codec only describes occupied voxels, so the air between them has to be
+            // written, not assumed.
+            std::vector<uint32_t> back(per_chunk, 0xDEADBEEFu);
+            size_t written = 0;
+            REQUIRE_EQ(bsvx_region_decode_chunk_u32(world.get(), region, 0, 0, 0,
+                back.data(), back.size(), &written), BSVX_RESULT_OK);
+            REQUIRE_EQ(written, per_chunk);
+            REQUIRE(back == dense);
+            return std::pair<size_t, uint16_t>{ size, stored };
+            };
+
+        const size_t list_bytes = store_as(surface, 4u /*SPARSE_LIST*/).first;
+        const size_t packed_bytes = store_as(surface, 7u /*SPARSE_PACKED*/).first;
+        const size_t bitpack_bytes = store_as(surface, 3u /*PALLETE_BITPACK*/).first;
+
+        // Eight bytes a voxel behind a u32 count.
+        REQUIRE_EQ(list_bytes, 4u + surface_non_air * 8u);
+        // An 8-byte header, an eight-entry palette, then 12 index bits and 3 palette bits a voxel,
+        // as two separately byte-aligned streams. Spelled out because the whole point of the codec
+        // is the widths: if bit_width ever creeps back to 13 index bits, this is what catches it.
+        REQUIRE_EQ(packed_bytes,
+            8u + 8u * 4u + (surface_non_air * 12u + 7u) / 8u + (surface_non_air * 3u + 7u) / 8u);
+        REQUIRE(packed_bytes * 2u < list_bytes);
+        REQUIRE(packed_bytes * 2u < bitpack_bytes);
+
+        // AUTO has to actually reach for it.
+        REQUIRE_EQ(store_as(surface, 0xFFFFu).second, 7u);
+
+        // ... but only when it wins. One voxel pays the palette and the header for nothing, so the
+        // plain list is smaller and the chooser is still expected to compare rather than prefer.
+        std::vector<uint32_t> lone(per_chunk, 0u);
+        lone[1234] = 5u;
+        REQUIRE_EQ(store_as(lone, 0xFFFFu).second, 4u /*SPARSE_LIST*/);
+
+        // A full chunk belongs to the palette codec, which is the case a packed *sparse* list is
+        // worst at: it still spends an index on every voxel.
+        std::vector<uint32_t> dense(per_chunk, 0u);
+        for (size_t i = 0; i < per_chunk; ++i) dense[i] = 1u + static_cast<uint32_t>(i % 2u);
+        REQUIRE_EQ(store_as(dense, 0xFFFFu).second, 3u /*PALLETE_BITPACK*/);
+
+        // Finally: the codec has to survive the file, not just the writer's memory.
+        REQUIRE_EQ(bsvx_region_set_chunk_u32_ex(ctx.get(), world.get(), region, 0, 0, 0,
+            surface.data(), surface.size(), 7u), BSVX_RESULT_OK);
+
+        const fs::path out_root = make_temp_dir("sparse_packed_codec");
+        REQUIRE_EQ(bsvx_world_save_ex(ctx.get(), world.get(), path_to_utf8_string(out_root).c_str()), BSVX_RESULT_OK);
+
+        World reloaded = load_world(ctx, out_root / "manifest.toml");
+        size_t reloaded_size = 0;
+        uint16_t reloaded_codec = 0;
+        REQUIRE_EQ(bsvx_region_get_chunk_payload_info(reloaded.get(), 0, 2u, 0, 0, 0,
+            &reloaded_size, &reloaded_codec, nullptr), BSVX_RESULT_OK);
+        REQUIRE_EQ(reloaded_codec, 7u);
+        REQUIRE_EQ(reloaded_size, packed_bytes);
+
+        std::vector<uint32_t> from_disk(per_chunk, 0xDEADBEEFu);
+        size_t written = 0;
+        REQUIRE_EQ(bsvx_region_decode_chunk_u32(reloaded.get(), 0, 0, 0, 0,
+            from_disk.data(), from_disk.size(), &written), BSVX_RESULT_OK);
+        REQUIRE(from_disk == surface);
+    }
+
     void test_bulk_accessors()
     {
         Context ctx;
@@ -2623,6 +2727,7 @@ int main()
     failures += run_test("validation", test_validation);
     failures += run_test("bulk_accessors", test_bulk_accessors);
     failures += run_test("decode_all_non_cubic_with_holes", test_decode_all_non_cubic_with_holes);
+    failures += run_test("sparse_packed_codec", test_sparse_packed_codec);
     failures += run_test("chunk_content_hash", test_chunk_content_hash);
     failures += run_test("texture_authoring", test_texture_authoring);
     failures += run_test("paths_and_progress", test_paths_and_progress);

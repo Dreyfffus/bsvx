@@ -52,6 +52,7 @@ namespace anatomy {
 		case VoxelCodec::SPARSE_LIST:        return "sparse";
 		case VoxelCodec::Y_COLUMN_INTERVALS: return "y-runs";
 		case VoxelCodec::RAW_DENSE:          return "raw";
+		case VoxelCodec::SPARSE_PACKED:      return "packed";
 		default:                             return "?";
 		}
 	}

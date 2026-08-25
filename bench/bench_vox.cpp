@@ -323,13 +323,15 @@ namespace {
 		return grid;
 	}
 
-	// What a bit-packed sparse codec would cost, chunk by chunk, if bsvx had one.
+	// What a bit-packed sparse codec costs, chunk by chunk, priced from the grid rather than from
+	// the file.
 	//
-	// The existing SPARSE_LIST spends a full uint32 on the linear index and another on the voxel
-	// key: 8 bytes a voxel, twice what .vox's (x, y, z, colour) record costs. Neither field needs
-	// that width inside a chunk -- a 16x16x16 chunk indexes in 12 bits, and a chunk with eight
-	// distinct keys indexes its own palette in 3. This is what the payloads would come to at those
-	// widths, so the gap on sparse content can be read as a codec gap rather than a format one.
+	// SPARSE_LIST spends a full uint32 on the linear index and another on the voxel key: 8 bytes a
+	// voxel, twice what .vox's (x, y, z, colour) record costs. Neither field needs that width inside
+	// a chunk -- a 16x16x16 chunk indexes in 12 bits, and a chunk with eight distinct keys indexes
+	// its own palette in 3. This was written to size that gap before SPARSE_PACKED existed; now that
+	// it does, the model and the shipped encoder are two independent answers to the same question,
+	// and the table reads as a check that they agree.
 	//
 	// Layout priced: u16 palette count, u8 index bits, u8 key bits, u32 voxel count, the palette
 	// as uint32, then (index_bits + key_bits) per non-air voxel, bit-packed.
@@ -773,7 +775,7 @@ namespace {
 		std::printf("\nfixed%% is header + chunk map + summary table + section/entry tables as a share of the\n");
 		std::printf("file: the part that scales with chunk count rather than with voxel count.\n");
 
-		std::printf("\nwhat a bit-packed sparse codec would change (payload only, fixed overhead unchanged)\n");
+		std::printf("\ncross-check: this model of a bit-packed sparse codec against SPARSE_PACKED as shipped\n");
 		std::printf("%-18s | %10s %10s %8s | %10s %10s %8s\n",
 			"scene", "payload", "would be", "saved", ".bvx now", "would be", "vs .vox");
 		std::printf("%s\n", std::string(84, '-').c_str());

@@ -21,6 +21,12 @@ namespace bsvx::bvx {
 	std::vector<std::byte> encode_voxels_uniform(uint32_t voxel_key);
 	std::vector<std::byte> encode_voxels_raw_dense(std::span<const uint32_t> dense);
 	std::vector<std::byte> encode_voxels_sparse_list(std::span<const uint32_t> dense);
+	// SPARSE_LIST with both of its fields cut to the width they actually need: a chunk-linear index
+	// fits the chunk (12 bits for 16^3, not 32), and a voxel key becomes an index into the chunk's
+	// own palette. Costs roughly two bytes a voxel where SPARSE_LIST costs eight, which is what
+	// makes surface-like content -- a shell, a heightfield skin -- competitive with a flat voxel
+	// list instead of several times its size.
+	std::vector<std::byte> encode_voxels_sparse_packed(std::span<const uint32_t> dense);
 	std::vector<std::byte> encode_voxels_palette_bitpack(std::span<const uint32_t> dense);
 	std::vector<std::byte> encode_voxels_y_column_intervals(std::span<const uint32_t> dense, uint16_t sx, uint16_t sy, uint16_t sz);
 	// Where a decoded chunk is written.
@@ -78,6 +84,7 @@ namespace bsvx::bvx {
 	void decode_voxels_uniform_into(std::span<const std::byte> payload, std::span<uint32_t> out);
 	void decode_voxels_raw_dense_into(std::span<const std::byte> payload, std::span<uint32_t> out);
 	void decode_voxels_sparse_list_into(std::span<const std::byte> payload, std::span<uint32_t> out);
+	void decode_voxels_sparse_packed_into(std::span<const std::byte> payload, std::span<uint32_t> out);
 	void decode_voxels_palette_bitpack_into(std::span<const std::byte> payload, std::span<uint32_t> out);
 	void decode_voxels_y_column_intervals_into(std::span<const std::byte> payload, uint16_t sx, uint16_t sy, uint16_t sz, std::span<uint32_t> out);
 	void decode_voxel_payload_into(VoxelCodec codec, std::span<const std::byte> payload, uint16_t sx, uint16_t sy, uint16_t sz, std::span<uint32_t> out);
@@ -86,6 +93,7 @@ namespace bsvx::bvx {
 	std::vector<uint32_t>  decode_voxels_uniform(std::span<const std::byte> payload, size_t count);
 	std::vector<uint32_t>  decode_voxels_raw_dense(std::span<const std::byte> payload, size_t count);
 	std::vector<uint32_t>  decode_voxels_sparse_list(std::span<const std::byte> payload, size_t count);
+	std::vector<uint32_t>  decode_voxels_sparse_packed(std::span<const std::byte> payload, size_t count);
 	std::vector<uint32_t>  decode_voxels_palette_bitpack(std::span<const std::byte> payload, size_t count);
 	std::vector<uint32_t>  decode_voxels_y_column_intervals(std::span<const std::byte> payload, uint16_t sx, uint16_t sy, uint16_t sz);
 	std::vector<uint32_t>  decode_voxel_payload(VoxelCodec codec, std::span<const std::byte> payload, uint16_t sx, uint16_t sy, uint16_t sz);

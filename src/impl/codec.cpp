@@ -114,6 +114,58 @@ namespace bsvx::bvx {
 		return out;
 	}
 
+	namespace {
+		// Bits needed to hold any of `value_count` distinct values, i.e. 0..value_count-1. Not
+		// bit_width_u32, which answers bit_width(n) and so spends a bit too many at every power of
+		// two -- exactly where chunk sizes sit. A 16^3 chunk indexes in 12 bits here and 13 there,
+		// and on a codec whose whole point is width this is 8% of the payload.
+		uint8_t index_bits_for(size_t value_count)
+		{
+			if (value_count <= 2u) return 1u;
+			uint8_t bits = 0;
+			size_t largest = value_count - 1u;
+			while (largest != 0u) { ++bits; largest >>= 1u; }
+			return bits;
+		}
+	}
+
+	std::vector<std::byte> encode_voxels_sparse_packed(std::span<const uint32_t> dense)
+	{
+		std::unordered_map<uint32_t, uint32_t> index_of;
+		std::vector<uint32_t> palette;
+		std::vector<uint32_t> positions;
+		std::vector<uint32_t> palette_indices;
+
+		// Air is implicit, so unlike PALLETE_BITPACK the palette holds only the keys that are there.
+		for (uint32_t i = 0; i < dense.size(); ++i) {
+			const uint32_t v = dense[i];
+			if (v == 0u) continue;
+			const auto [it, inserted] = index_of.try_emplace(v, static_cast<uint32_t>(palette.size()));
+			if (inserted) palette.push_back(v);
+			positions.push_back(i);
+			palette_indices.push_back(it->second);
+		}
+
+		if (palette.size() > std::numeric_limits<uint16_t>::max()) throw std::runtime_error("[bvx]: palette too large for u16 count");
+
+		const uint8_t index_bits = index_bits_for(dense.size());
+		const uint8_t key_bits = index_bits_for(palette.size());
+
+		std::vector<std::byte> out;
+		append_u16(out, static_cast<uint16_t>(palette.size()));
+		append_u8(out, index_bits);
+		append_u8(out, key_bits);
+		append_u32(out, static_cast<uint32_t>(positions.size()));
+		append_raw(out, std::span<const uint32_t>(palette.data(), palette.size()));
+
+		// Two runs rather than one interleaved stream: each is a single tight loop over one width,
+		// and because pack_indices_lsb flushes its partial byte the second starts at a boundary the
+		// decoder can compute from the count. Costs at most one byte of padding.
+		pack_indices_lsb(std::span<const uint32_t>(positions.data(), positions.size()), index_bits, out);
+		pack_indices_lsb(std::span<const uint32_t>(palette_indices.data(), palette_indices.size()), key_bits, out);
+		return out;
+	}
+
 	std::vector<std::byte> encode_voxels_palette_bitpack(std::span<const uint32_t> dense)
 	{
 		std::unordered_map<uint32_t, uint32_t> index_of;
@@ -226,6 +278,38 @@ namespace bsvx::bvx {
 			uint64_t mask_;
 		};
 
+		// Header parse and iteration for SPARSE_PACKED, shared by the VoxelDest path and the
+		// contiguous-span one, which address their destination differently but decode identically.
+		// `emit` is called with a chunk-linear index and the resolved voxel key.
+		template <class Emit>
+		void walk_sparse_packed(std::span<const std::byte> payload, size_t voxel_count, Emit&& emit)
+		{
+			size_t cursor = 0;
+			const uint16_t palette_count = read_pod<uint16_t>(payload, cursor);
+			const uint8_t index_bits = read_pod<uint8_t>(payload, cursor);
+			const uint8_t key_bits = read_pod<uint8_t>(payload, cursor);
+			const uint32_t count = read_pod<uint32_t>(payload, cursor);
+
+			std::vector<uint32_t> palette(palette_count);
+			for (uint16_t i = 0; i < palette_count; ++i) palette[i] = read_pod<uint32_t>(payload, cursor);
+
+			if (count == 0u) return;
+
+			const size_t position_bytes = (static_cast<size_t>(count) * index_bits + 7u) / 8u;
+			if (cursor + position_bytes > payload.size()) throw std::runtime_error("[bvx]: packed sparse payload truncated");
+
+			LsbBitReader positions(payload.subspan(cursor, position_bytes), index_bits);
+			LsbBitReader keys(payload.subspan(cursor + position_bytes), key_bits);
+
+			for (uint32_t i = 0; i < count; ++i) {
+				const uint32_t index = positions.next();
+				const uint32_t key_index = keys.next();
+				if (index >= voxel_count) throw std::runtime_error("[bvx]: packed sparse index out of range");
+				if (key_index >= palette.size()) throw std::runtime_error("[bvx]: packed sparse palette index out of range");
+				emit(index, palette[key_index]);
+			}
+		}
+
 		void fill_dest(const VoxelDest& dest, uint32_t value)
 		{
 			for (uint16_t z = 0; z < dest.sz; ++z) {
@@ -248,6 +332,7 @@ namespace bsvx::bvx {
 		switch (codec) {
 		case VoxelCodec::CHUNK_EMPTY:
 		case VoxelCodec::SPARSE_LIST:
+		case VoxelCodec::SPARSE_PACKED:
 		case VoxelCodec::Y_COLUMN_INTERVALS:
 			return true;
 		default:
@@ -310,6 +395,13 @@ namespace bsvx::bvx {
 				if (idx >= voxel_count) throw std::runtime_error("[bvx]: sparse list index out of range");
 				*dest.at_linear(idx) = key;
 			}
+			return;
+		}
+
+		case VoxelCodec::SPARSE_PACKED: {
+			clear_unless_air(dest);
+			walk_sparse_packed(payload, dest.voxel_count(),
+				[&](uint32_t index, uint32_t key) { *dest.at_linear(index) = key; });
 			return;
 		}
 
@@ -415,6 +507,15 @@ namespace bsvx::bvx {
 		}
 	}
 
+	// Separate from the VoxelDest path for the same reason as decode_voxels_sparse_list_into: this
+	// signature carries a voxel count rather than chunk dimensions, so a linear index lands directly
+	// instead of being decomposed. The decode itself is shared.
+	void decode_voxels_sparse_packed_into(std::span<const std::byte> payload, std::span<uint32_t> out)
+	{
+		std::fill(out.begin(), out.end(), 0u);
+		walk_sparse_packed(payload, out.size(), [&](uint32_t index, uint32_t key) { out[index] = key; });
+	}
+
 	void decode_voxels_palette_bitpack_into(std::span<const std::byte> payload, std::span<uint32_t> out)
 	{
 		size_t cursor = 0;
@@ -463,6 +564,13 @@ namespace bsvx::bvx {
 	{
 		std::vector<uint32_t> out(voxel_count);
 		decode_voxels_sparse_list_into(payload, out);
+		return out;
+	}
+
+	std::vector<uint32_t> decode_voxels_sparse_packed(std::span<const std::byte> payload, size_t voxel_count)
+	{
+		std::vector<uint32_t> out(voxel_count);
+		decode_voxels_sparse_packed_into(payload, out);
 		return out;
 	}
 
@@ -517,6 +625,7 @@ namespace bsvx::bvx {
 
 		try_candidate(VoxelCodec::PALLETE_BITPACK, encode_voxels_palette_bitpack(dense));
 		try_candidate(VoxelCodec::SPARSE_LIST, encode_voxels_sparse_list(dense));
+		try_candidate(VoxelCodec::SPARSE_PACKED, encode_voxels_sparse_packed(dense));
 		try_candidate(VoxelCodec::Y_COLUMN_INTERVALS, encode_voxels_y_column_intervals(dense, sx, sy, sz));
 		return best;
 	}

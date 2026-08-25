@@ -137,6 +137,7 @@ namespace bsvx::bvx {
 			case VoxelCodec::CHUNK_UNIFORM:         payload.bytes = encode_voxels_uniform(dense.empty() ? 0u : dense[0]); break;
 			case VoxelCodec::PALLETE_BITPACK:		payload.bytes = encode_voxels_palette_bitpack(dense); break;
 			case VoxelCodec::SPARSE_LIST:			payload.bytes = encode_voxels_sparse_list(dense); break;
+			case VoxelCodec::SPARSE_PACKED:			payload.bytes = encode_voxels_sparse_packed(dense); break;
 			case VoxelCodec::Y_COLUMN_INTERVALS:	payload.bytes = encode_voxels_y_column_intervals(dense, g.chunk_size_x, g.chunk_size_y, g.chunk_size_z); break;
 			case VoxelCodec::RAW_DENSE:				payload.bytes = encode_voxels_raw_dense(dense); break;
 			default: throw std::runtime_error("[bvx]: unsupported requested codec");
