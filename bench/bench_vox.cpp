@@ -12,7 +12,7 @@
 
 #include "bsvx_dll.h"
 #include "bvx_anatomy.hpp"
-#include "vox.hpp"
+#include "vox.hpp"   // tools/vox.hpp
 
 #include <algorithm>
 #include <chrono>

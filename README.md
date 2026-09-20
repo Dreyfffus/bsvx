@@ -172,6 +172,32 @@ from fighting whatever older runtime the host process already has mapped in.
 
 ---
 
+## Command line
+
+The build also produces a `bsvx` executable (`BSVX_BUILD_CLI`, on by default at the top level;
+`--no-cli` under premake). It is written against the public C ABI only, so it doubles as a check
+that the ABI is enough to write an importer with.
+
+```bash
+bsvx --convert scene.vox scene.bvx            # or -C
+bsvx -C scene.vox scene.bvx --chunk 32 --include-hidden
+bsvx -C scene.vox part.bvx --model 3          # one model, in its own frame
+```
+
+The whole scene is converted: every model the scene graph places, at the position and rotation its
+`nTRN` chain gives it, hidden instances and hidden layers left out unless `--include-hidden`. The
+placement follows MagicaVoxel's own rule — a transform acts about the model's pivot at
+`floor(size / 2)` and on the corners of a cell, so a mirrored axis lands a voxel at `-c-1` — and is
+checked against opengametools' `ogt_vox` on its test scenes. Where instances overlap, the later one
+in scene order wins. `--model N` converts one model alone and ignores the scene graph.
+
+The scene lands in the canonical Y-up frame with its minimum corner at the origin — MagicaVoxel is
+Z-up, and every cell goes through `bsvx_convert_cell` on the way in, the same as the Blender add-on
+does on export. Colours in use become registry entries carrying the `.vox` palette colour, so the
+file renders meaningfully before it has a `.btx`.
+
+---
+
 ## Integrations
 
 `integrations/` holds host plugins built on the C ABI. Each owns its own packaging and its host's

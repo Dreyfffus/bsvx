@@ -13,6 +13,7 @@
 --   --static-lib            build bsvx as a static archive instead of a DLL
 --   --static-runtime        link the C++ runtime statically
 --   --no-tests              skip the test runner
+--   --no-cli                skip the bsvx command-line tool
 --   --no-python-stage       do not copy the built library into python/bsvx/bin/<platform>/
 --   --godot-cpp=DIR         godot-cpp source tree, enabling the GDExtension project
 --   --godot-cpp-gen=DIR     godot-cpp's generated headers (its build dir's gen/include)
@@ -32,6 +33,11 @@ newoption {
 newoption {
     trigger     = "no-tests",
     description = "Do not generate the test runner project"
+}
+
+newoption {
+    trigger     = "no-cli",
+    description = "Do not generate the bsvx command-line tool project"
 }
 
 newoption {
@@ -200,6 +206,62 @@ project "bsvx_tests"
         defines { "BSVX_ASSETS_USE_DLL" }
         filter "system:windows"
             -- Windows resolves a DLL beside the executable; elsewhere the linker's rpath does it.
+            postbuildcommands {
+                '{COPYFILE} "%{wks.location}/Binaries/' .. OutputDir .. '/bsvx/bsvx.dll" "%{cfg.targetdir}"'
+            }
+        filter "system:not windows"
+            linkoptions { "-Wl,-rpath,'$$ORIGIN/../bsvx'" }
+        filter {}
+    end
+
+end
+
+-- ------------------------------------------------------------------------------------------------
+-- Command-line tool
+-- ------------------------------------------------------------------------------------------------
+
+if not _OPTIONS["no-cli"] then
+
+project "bsvx_cli"
+    kind "ConsoleApp"
+    language "C++"
+    cppdialect "C++latest"
+    staticruntime (_OPTIONS["static-runtime"] and "on" or "off")
+    -- The executable is called bsvx like the library; the project cannot be.
+    targetname "bsvx"
+
+    targetdir ("Binaries/" .. OutputDir .. "/%{prj.name}")
+    objdir    ("Binaries/Intermediates/" .. OutputDir .. "/%{prj.name}")
+
+    files {
+        "tools/bsvx_cli.cpp",
+        "tools/vox.hpp",
+        "src/include/**.h"
+    }
+
+    includedirs { "src/include", "tools" }
+
+    links { "bsvx" }
+    dependson { "bsvx" }
+
+    filter "toolset:msc"
+        buildoptions { "/utf-8", "/Zc:__cplusplus" }
+
+    filter "system:windows"
+        systemversion "latest"
+        defines { "NOMINMAX", "_CRT_SECURE_NO_WARNINGS" }
+
+    filter "configurations:Debug"
+        symbols "On"
+
+    filter "configurations:Release"
+        optimize "Speed"
+
+    filter {}
+
+    if SHARED then
+        defines { "BSVX_ASSETS_USE_DLL" }
+        filter "system:windows"
             postbuildcommands {
                 '{COPYFILE} "%{wks.location}/Binaries/' .. OutputDir .. '/bsvx/bsvx.dll" "%{cfg.targetdir}"'
             }

@@ -119,6 +119,24 @@ if(BSVX_BUILD_TESTS)
     add_test(NAME bsvx_tests COMMAND bsvx_tests WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+# The command-line tool: `bsvx --convert model.vox model.bvx`. Built through the public C ABI only,
+# like any other consumer, so it doubles as a check that the ABI is enough to write an importer.
+option(BSVX_BUILD_CLI "Build the bsvx command-line tool" ${PROJECT_IS_TOP_LEVEL})
+if(BSVX_BUILD_CLI)
+    add_executable(bsvx_cli "${CMAKE_CURRENT_SOURCE_DIR}/tools/bsvx_cli.cpp")
+    target_link_libraries(bsvx_cli PRIVATE bsvx)
+    target_include_directories(bsvx_cli PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tools")
+    # The executable is called `bsvx` like the library; the target cannot be. On MSVC both would
+    # also write bsvx.pdb into the same directory, so the tool's is renamed.
+    set_target_properties(bsvx_cli PROPERTIES OUTPUT_NAME bsvx PDB_NAME bsvx_cli)
+    if(BSVX_BUILD_SHARED)
+        target_compile_definitions(bsvx_cli PRIVATE BSVX_ASSETS_USE_DLL)
+    endif()
+    if(MSVC)
+        target_compile_options(bsvx_cli PRIVATE /utf-8)
+    endif()
+endif()
+
 # Off by default: it is a measurement tool, not part of the library or of what CI gates on, and it
 # writes multi-megabyte fixtures to disk when it runs.
 option(BSVX_BUILD_BENCH "Build the .vox comparison benchmark" OFF)
@@ -126,9 +144,10 @@ if(BSVX_BUILD_BENCH)
     add_executable(bench_vox "${CMAKE_CURRENT_SOURCE_DIR}/bench/bench_vox.cpp")
     target_link_libraries(bench_vox PRIVATE bsvx)
     # bvx_anatomy.hpp reads the on-disk structures through the library's own layout headers, which
-    # live in src/impl's include path alongside the public ones.
+    # live in src/impl's include path alongside the public ones; vox.hpp is shared with the CLI.
     target_include_directories(bench_vox PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/bench"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/impl")
     if(BSVX_BUILD_SHARED)
         target_compile_definitions(bench_vox PRIVATE BSVX_ASSETS_USE_DLL)
@@ -150,6 +169,10 @@ install(TARGETS bsvx
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+
+if(BSVX_BUILD_CLI)
+    install(TARGETS bsvx_cli RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+endif()
 
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/include/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"

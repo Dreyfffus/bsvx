@@ -424,6 +424,7 @@ FodyWeavers.xsd
 # CMake / Ninja out-of-source builds (see CMakeLists.txt)
 build/
 cmake-build-*/
+build-*/
 
 # Artifacts of the documented one-liner g++ build
 /libbsvx.so
